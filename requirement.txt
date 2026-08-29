@@ -1,0 +1,9 @@
+openai
+chatgpt
+crypto
+sha256
+bip85
+bitcoin
+ethereum
+flask
+autopep8
