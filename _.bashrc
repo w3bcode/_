@@ -3,6 +3,9 @@
 # Android 16 / unrooted / ~16GB RAM / llama + Ollama bridge
 # =============================================================================
 
+# Python3 instance activate
+source /home/loop/.env.local/bin/activate
+
 # -----------------------------------------------------------------------------
 # Interactive shell guard
 #
@@ -771,3 +774,10 @@ fi
 if [[ -z "${PS1:-}" ]]; then
   PS1='\u@\h:\w\$ '
 fi
+
+# user credits
+eval $(ssh-agent -s)
+cd
+clear
+screenfetch
+alias qwen='~/_/qwen_cli/qwen.sh'
