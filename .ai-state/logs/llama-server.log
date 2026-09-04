@@ -1,9 +1,0 @@
-warning: no usable GPU found, --gpu-layers option will be ignored
-warning: one possible reason is that llama.cpp was compiled without GPU support
-warning: consult docs/build.md for compilation instructions
-0.00.990.915 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
-0.00.993.845 W srv  llama_server: -----------------
-0.00.994.071 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
-0.00.994.075 W srv  llama_server: this can be a security risk (cross-origin attacks)
-0.00.994.078 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
-0.00.994.081 W srv  llama_server: -----------------
