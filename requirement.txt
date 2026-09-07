@@ -7,3 +7,4 @@ bitcoin
 ethereum
 flask
 autopep8
+huggingface_hub

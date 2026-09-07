@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# ai-fusion.sh 3.0.0 — high-performance local AI fusion controller
+# ai.sh 3.0.3 â€” high-performance local AI fusion controller
 # =============================================================================
 # Unified llama.cpp CLI + Ollama + Gemini Interactions backend.
 #
@@ -22,11 +22,19 @@
 #
 # Dependencies: bash>=4, curl, jq, awk, sed, grep, find, sort, stat, wc,
 #               sha256sum/shasum, optionally md5sum/md5, node, timeout, base64
+# 3.0.1: per-view state isolation, task-scoped ranking, fresh view/final files per
+#        run, boolean think/stream/background, logprobs-backed entropy with fallback,
+#        real-extension validation in fix, valid --image JSON, poll limits, --reset,
+#        RAW_PROMPT for --file, locked ledger appends, portable ms timestamps.
+# 3.0.3: interruptible runs â€” Ctrl+C/SIGTERM/SIGHUP now kill all background views
+#        and their llama children, then exit 128+n (previously the signal was swallowed
+#        by the throttle loop and the run continued through every view); visible
+#        per-view progress lines; busy-spin guard in the wait loop.
 # =============================================================================
 set -o pipefail
 shopt -s nullglob
 
-VERSION="3.0.0"
+VERSION="3.0.3"
 AI_NAME="loopshape-ai-fusion"
 BASE="${AI_HOME:-${HOME}/_}"
 STATE="${AI_STATE_DIR:-$BASE/.ai-state}"
@@ -80,9 +88,11 @@ AI_EMERGENCY="${AI_EMERGENCY:-qwen3:0.6b}"
 KEEP_ALIVE="${AI_KEEP_ALIVE:-5m}"
 THINK="${AI_THINK:-auto}"
 AI_MAX_RAM_GB="${AI_MAX_RAM_GB:-0}"
-AI_ENTROPY_UPGRADE="${AI_ENTROPY_UPGRADE:-1.55}"
-AI_ENTROPY_DOWNGRADE="${AI_ENTROPY_DOWNGRADE:-0.55}"
+AI_ENTROPY_UPGRADE="${AI_ENTROPY_UPGRADE:-1.55}"      # reserved for adaptive ladder; not yet wired
+AI_ENTROPY_DOWNGRADE="${AI_ENTROPY_DOWNGRADE:-0.55}"    # reserved for adaptive ladder; not yet wired
 AI_TOP_LOGPROBS="${AI_TOP_LOGPROBS:-5}"
+AI_LOGPROBS="${AI_LOGPROBS:-1}"
+LOGPROBS="$AI_LOGPROBS"
 
 VIEWS="${AI_VIEWS:-8}"
 PARALLEL="${AI_PARALLEL:-0}"
@@ -117,6 +127,9 @@ IMAGE_B64="[]"
 UNLOAD=0
 MODEL=""
 EXPLICIT=0
+STATE_TAG=""        # per-caller suffix isolating shared state files in parallel views
+RAW_PROMPT=0        # 1 = skip directive parsing (--file)
+SELECTED_MODEL=""  # model actually chosen this run (for --unload)
 
 EXCLUDE_REGEX='(^|/)(\.git|node_modules|\.venv|__pycache__|dist|build|\.ai-state)(/|$)'
 SYSTEM_PROMPT="${AI_SYSTEM_PROMPT:-You are a precise local software agent. Produce technically correct, testable results. Separate observations from assumptions. Do not expose hidden chain-of-thought; provide concise conclusions and verification steps. Never claim to have executed commands you did not execute.}
@@ -135,6 +148,8 @@ log(){ (( VERBOSE )) && printf '[ai] %s\n' "$*" >&2 || true; }
 warn(){ printf 'ai-fusion: warning: %s\n' "$*" >&2; }
 die(){ printf 'ai-fusion: %s\n' "$*" >&2; exit 1; }
 now(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
+# state files are tagged per caller (view-N, synthesis) so parallel runs never clobber each other
+stpath(){ printf '%s/last-%s%s' "$STATE" "$1" "${STATE_TAG:+-$STATE_TAG}"; }
 
 sha256_text(){ if [[ "$SHA_CMD" == sha256sum ]]; then printf '%s' "$1"|sha256sum|awk '{print $1}'; else printf '%s' "$1"|shasum -a 256|awk '{print $1}'; fi; }
 sha256_file(){ if [[ "$SHA_CMD" == sha256sum ]]; then sha256sum "$1"|awk '{print $1}'; else shasum -a 256 "$1"|awk '{print $1}'; fi; }
@@ -142,12 +157,12 @@ md5_text(){ [[ -n "$MD5_CMD" ]] || { printf 'md5-unavailable'; return; }; if [[ 
 
 init_db(){ for f in roots sessions tasks files traces scores events tokens artifacts runs reference interactions tool-calls; do [[ -f "$DB/$f.jsonl" ]] || : > "$DB/$f.jsonl"; done; [[ -f "$DB/index.json" ]] || jq -nc --arg v "$VERSION" --arg at "$(now)" '{schema:2,version:$v,createdAt:$at}' > "$DB/index.json"; }
 init_db
-append_json(){ printf '%s\n' "$2" >> "$DB/$1.jsonl"; }
+append_json(){ local f="$DB/$1.jsonl"; if command -v flock >/dev/null 2>&1; then { flock -x 200; printf '%s\n' "$2" >&200; } 200>>"$f"; else printf '%s\n' "$2" >>"$f"; fi; }
 object_put(){ local text="$1" h; h="$(sha256_text "$text")"; printf '%s' "$text" > "$OBJECTS/$h"; printf '%s' "$h"; }
 
 event(){ local type="$1" data="${2:-}" ts id json; [[ -n "$data" ]] || data="{}"; ts="$(now)"; id="$(sha256_text "$SESSION|$ts|$type|$RANDOM")"; json="$(jq -cn --arg id "$id" --arg type "$type" --arg at "$ts" --arg session "$SESSION" --argjson data "$data" '{id:$id,event_type:$type,at:$at,session:$session,data:$data}')" || return; append_json events "$json"; (( VERBOSE )) && printf '[event] %s\n' "$type" >&2 || true; }
 
-genesis_new(){ local ts mod7 seed root; ts="$(date +%s%3N 2>/dev/null || date +%s000)"; mod7=$((ts%7)); seed="$ts|$mod7|$SESSION|$BASE|${USER:-unknown}"; root="$(sha256_text "$seed")"; GENESIS_HASH="$root"; printf '%s\n' "$root" > "$STATE/genesis.hash"; append_json roots "$(jq -cn --arg id "$root" --arg ts "$ts" --argjson m "$mod7" --arg s "$SESSION" --arg w "$BASE" '{genesisHash:$id,timestampMs:$ts,mod7:$m,session:$s,workspace:$w}')"; event interaction.created "$(jq -cn --arg g "$root" --argjson m "$mod7" '{genesisHash:$g,mod7:$m}')"; }
+genesis_new(){ local ts mod7 seed root; ts="$(date +%s%3N 2>/dev/null)"; [[ "$ts" =~ ^[0-9]+$ ]] || ts="$(date +%s)000"; mod7=$((ts%7)); seed="$ts|$mod7|$SESSION|$BASE|${USER:-unknown}"; root="$(sha256_text "$seed")"; GENESIS_HASH="$root"; printf '%s\n' "$root" > "$STATE/genesis.hash"; append_json roots "$(jq -cn --arg id "$root" --arg ts "$ts" --argjson m "$mod7" --arg s "$SESSION" --arg w "$BASE" '{genesisHash:$id,timestampMs:$ts,mod7:$m,session:$s,workspace:$w}')"; event interaction.created "$(jq -cn --arg g "$root" --argjson m "$mod7" '{genesisHash:$g,mod7:$m}')"; }
 genesis_current(){ [[ -s "$STATE/genesis.hash" ]] && cat "$STATE/genesis.hash" || { genesis_new; cat "$STATE/genesis.hash"; }; }
 
 # -----------------------------------------------------------------------------
@@ -157,6 +172,82 @@ ram_total_kb(){ awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0
 ram_avail_kb(){ awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0; }
 ram_total_gb(){ awk "BEGIN{printf \"%.2f\", $(ram_total_kb)/1048576}"; }
 ram_avail_gb(){ awk "BEGIN{printf \"%.2f\", $(ram_avail_kb)/1048576}"; }
+
+# --- interrupt safety -------------------------------------------------------
+# Without this trap, SIGINT interrupts the `wait` builtin, `||true` swallows it,
+# and the run continues through every remaining view â€” the script never returns
+# to the shell while llama children (in their own process groups via timeout)
+# keep loading models. _ai_view_pids is populated by run_prompt.
+_ai_view_pids=()
+_ai_view_groups=()
+_ai_pgid_of(){ # /proc-based pgrp lookup â€” no ps/pgrep dependency
+  local s; s="$(cat /proc/"$1"/stat 2>/dev/null)" || return 0
+  s="${s##*) }"; set -- $s; printf '%s' "$3"
+}
+_ai_children_of(){ # direct children of $1 via /proc/*/status (PPid:)
+  local d x; for d in /proc/[0-9]*; do
+    x="$(awk '/^PPid:/{print $2; exit}' "$d/status" 2>/dev/null)" || continue
+    [[ "$x" == "$1" ]] && echo "${d#/proc/}"
+  done; return 0
+}
+_ai_kill_view(){ # _ai_kill_view VIEW_PID SIGNAL â€” kill view plus EVERY process under it
+  # NOTE: all words of a single `local` are expanded BEFORE any assignment
+  # takes effect, so frontier must be set in a separate statement
+  local p="$1" sig="$2" c g x mypgid all="" found
+  local frontier="$p"
+  mypgid="$(_ai_pgid_of $$)"
+  # BFS the whole descendant tree BEFORE killing anything, so no pid can be
+  # lost to reparenting mid-cleanup
+  while [[ -n "$frontier" ]]; do
+    found=""
+    for c in $frontier; do
+      all+=" $c"
+      while read -r x; do [[ -n "$x" ]] && found+=" $x"; done < <(_ai_children_of "$c")
+    done
+    frontier="$found"
+  done
+  # group kills first â€” catch stragglers that forked after enumeration
+  for c in $all; do
+    g="$(_ai_pgid_of "$c")"
+    if [[ -n "$g" && "$g" != "$mypgid" ]]; then
+      kill -"$sig" -- "-$g" 2>/dev/null || true
+      _ai_view_groups+=("$g")
+    fi
+  done
+  # then direct kills for anything not in a killable group
+  for c in $all; do kill -"$sig" "$c" 2>/dev/null || true; done
+  return 0
+}
+_ai_kill_descendants(){ # kill every tree UNDER root (root itself is spared)
+  local root="$1" sig="$2" c
+  while read -r c; do
+    [[ -n "$c" ]] && _ai_kill_view "$c" "$sig"
+  done < <(_ai_children_of "$root")
+  return 0
+}
+_ai_sig_cleanup(){
+  local sig="$1" p g
+  if (( ${#_ai_view_pids[@]} )); then
+    for p in "${_ai_view_pids[@]}"; do _ai_kill_view "$p" TERM; done
+    sleep 1
+    # force round: re-sweep trees AND every group seen in the TERM round
+    for p in "${_ai_view_pids[@]}"; do _ai_kill_view "$p" KILL; done
+    for g in "${_ai_view_groups[@]}"; do kill -KILL -- "-$g" 2>/dev/null || true; done
+    printf 'ai-fusion: interrupted â€” stopped %d running view(s)\n' "${#_ai_view_pids[@]}" >&2
+  else
+    # no live view jobs â€” e.g. interrupt during the synthesis pass: the model
+    # runs in a background child of this script. Descendants only: including
+    # $$ itself would SIGKILL the shell mid-cleanup.
+    _ai_kill_descendants "$$" TERM
+    sleep 1
+    _ai_kill_descendants "$$" KILL
+    for g in "${_ai_view_groups[@]}"; do kill -KILL -- "-$g" 2>/dev/null || true; done
+    printf 'ai-fusion: interrupted\n' >&2
+  fi
+  _ai_view_pids=(); _ai_view_groups=()
+  trap - INT TERM HUP
+  kill -s "$sig" "$$"
+}
 
 # name|class|GB|context|vision|tools|rank
 MODELS=(
@@ -226,7 +317,7 @@ parse_envelope(){
 
 rank_tokens(){ local text="$1" tmp total; tmp="$(mktemp)"; printf '%s' "$text"|tr '\t\r\n' '   '|sed 's/[^[:alnum:]_+.#\/@:-]/ /g'|tr '[:upper:]' '[:lower:]'|awk '{for(i=1;i<=NF;i++)print $i}'|sort|uniq -c|sort -k1,1nr -k2,2 > "$tmp"; total="$(awk '{s+=$1}END{print s+0}' "$tmp")"; awk -v t="$total" 'BEGIN{OFS="\t"}{p=$1/t; s=-log(p)/log(2); w=(1-p)*s; print $2,$1,p,s,w}' "$tmp"; rm -f "$tmp"; }
 entropy_text(){ local text="$1"; awk -v s="$text" 'BEGIN{n=split(s,a,/[^[:alnum:]_+.#\/@:-]+/);t=0;for(i=1;i<=n;i++)if(a[i]!=""){c[a[i]]++;t++}if(!t){print 0;exit}h=0;for(k in c){p=c[k]/t;h-=p*log(p)/log(2)}printf "%.8f\n",h}'; }
-score_text(){ local t="$1" e n u w; e="$(entropy_text "$t")"; n="$(rank_tokens "$t"|awk '{s+=$2} END{print s+0}')"; u="$(rank_tokens "$t"|wc -l|awk '{print $1+0}')"; w="$(rank_tokens "$t"|awk '{s+=$5;n++}END{if(n)printf "%.8f",s/n;else print 0}')"; jq -cn --argjson entropy "$e" --argjson tokens "$n" --argjson unique "$u" --argjson weight "$w" '{entropy:$entropy,tokens:$tokens,unique:$unique,avgTokenWeight:$weight}'; }
+score_text(){ local t="$1" e n u w r; r="$(rank_tokens "$t")"; e="$(entropy_text "$t")"; n="$(awk '{s+=$2} END{print s+0}'<<<"$r")"; u="$(awk 'END{print NR+0}'<<<"$r")"; w="$(awk '{s+=$5;n++}END{if(n)printf "%.8f",s/n;else print 0}'<<<"$r")"; jq -cn --argjson entropy "$e" --argjson tokens "$n" --argjson unique "$u" --argjson weight "$w" '{entropy:$entropy,tokens:$tokens,unique:$unique,avgTokenWeight:$weight}'; }
 
 # -----------------------------------------------------------------------------
 # Gemini Interactions API backend
@@ -269,7 +360,7 @@ gemini_input_json(){
   if [[ -n "$f" && -f "$f" ]]; then
     mime="${MIME_TYPE:-$(gemini_mime "$f")}"; size="$(wc -c <"$f"|awk '{print $1}')";
     if [[ "$mime" == text/* && "$size" -le 10485760 ]]; then
-      jq -nc --arg p "$prompt" --arg t "$(cat "$f")" '[{type:"text",text:$p},{type:"text",text:("\n--- FILE: " + $t)}]'; return;
+      jq -nc --arg p "$prompt" --rawfile t "$f" '[{type:"text",text:$p},{type:"text",text:("\n--- FILE: " + $t)}]'; return;
     fi
     uri="$(gemini_upload "$f" "$mime")" || return 6;
     case "$mime" in image/*) typ=image;; audio/*) typ=audio;; video/*) typ=video;; *) typ=document;; esac
@@ -329,9 +420,9 @@ gemini_build_payload(){
     else
       envj="$(jq -nc --arg e "${env:-remote}" '$e')";
     fi
-    jq -nc --arg a "$agent" --argjson inp "$input_json" --argjson tl "$tools" --arg sys "$AGENT_SYSTEM" --argjson envj "$envj" --argjson acfg "$acfg" --argjson st "$store" --argjson rf "$rf" --arg tier "$GEMINI_SERVICE_TIER" --arg p "$prev" --argjson bg "$bg" --argjson str "$stream" '{agent:$a,input:$inp,stream:$str,background:$bg,store:$st}|if $tier!="standard" then .+{service_tier:$tier} else . end|if ($p|length)>0 then .+{previous_interaction_id:$p} else . end|if ($tl|length)>0 then .+{tools:$tl} else . end|if $sys!="" then .+{system_instruction:$sys} else . end|if ($acfg!=null) then .+{agent_config:$acfg} else . end|if ($envj!=null) then .+{environment:$envj} else . end|if $rf != null then .+{response_format:$rf} else . end';
+    jq -nc --arg a "$agent" --argjson inp "$input_json" --argjson tl "$tools" --arg sys "$AGENT_SYSTEM" --argjson envj "$envj" --argjson acfg "$acfg" --argjson st "$store" --argjson rf "$rf" --arg tier "$GEMINI_SERVICE_TIER" --arg p "$prev" --argjson bg "$bg" --argjson str "$stream" '{agent:$a,input:$inp,stream:($str==1 or $str==true),background:($bg==1 or $bg==true),store:$st}|if $tier!="standard" then .+{service_tier:$tier} else . end|if ($p|length)>0 then .+{previous_interaction_id:$p} else . end|if ($tl|length)>0 then .+{tools:$tl} else . end|if $sys!="" then .+{system_instruction:$sys} else . end|if ($acfg!=null) then .+{agent_config:$acfg} else . end|if ($envj!=null) then .+{environment:$envj} else . end|if $rf != null then .+{response_format:$rf} else . end';
   else
-    jq -nc --arg m "$model" --argjson inp "$input_json" --arg sys "$SYSTEM_PROMPT" --argjson tl "$tools" --argjson gc "$cfg" --argjson st "$store" --argjson rf "$rf" --arg p "$prev" --argjson bg "$bg" --argjson str "$stream" --arg tier "$GEMINI_SERVICE_TIER" '{model:$m,input:$inp,system_instruction:$sys,stream:$str,background:$bg,store:$st}|if $tier!="standard" then .+{service_tier:$tier} else . end|if ($p|length)>0 then .+{previous_interaction_id:$p} else . end|if ($tl|length)>0 then .+{tools:$tl} else . end|if ($gc|length)>0 then .+{generation_config:$gc} else . end|if $rf != null then .+{response_format:$rf} else . end';
+    jq -nc --arg m "$model" --argjson inp "$input_json" --arg sys "$SYSTEM_PROMPT" --argjson tl "$tools" --argjson gc "$cfg" --argjson st "$store" --argjson rf "$rf" --arg p "$prev" --argjson bg "$bg" --argjson str "$stream" --arg tier "$GEMINI_SERVICE_TIER" '{model:$m,input:$inp,system_instruction:$sys,stream:($str==1 or $str==true),background:($bg==1 or $bg==true),store:$st}|if $tier!="standard" then .+{service_tier:$tier} else . end|if ($p|length)>0 then .+{previous_interaction_id:$p} else . end|if ($tl|length)>0 then .+{tools:$tl} else . end|if ($gc|length)>0 then .+{generation_config:$gc} else . end|if $rf != null then .+{response_format:$rf} else . end';
   fi
 }
 
@@ -350,34 +441,34 @@ gemini_save_response_assets(){
 }
 
 gemini_generate(){
-  local prompt="$1" out="$2" model="${3:-$GEMINI_MODEL}" seed="${4:--1}" prev="${5:-}" stream="${6:-$STREAM}" bg="${7:-$BACKGROUND}" agent="${8:-}" env="${9:-}" payload response id rc status errmsg;
+  local prompt="$1" out="$2" model="${3:-$GEMINI_MODEL}" seed="${4:--1}" prev="${5:-}" stream="${6:-$STREAM}" bg="${7:-$BACKGROUND}" agent="${8:-}" env="${9:-}" payload response id rc status errmsg et dt data mime;
   gemini_available||return 127;
   payload="$(gemini_build_payload "$model" "$prompt" "$prev" "$stream" "$bg" "$agent" "$env")" || return 2;
-  printf '%s\n' "$payload" > "$STATE/last-gemini-request.json"; : >"$out"; rm -f "$out.stderr";
+  printf '%s\n' "$payload" > "$(stpath gemini-request).json"; : >"$out"; rm -f "$out.stderr";
   if ((stream)); then
-    : >"$STATE/last-gemini-stream.sse";
+    : >"$(stpath gemini-stream).sse";
     while IFS= read -r line; do
-      [[ "$line" == data:\ * ]]||continue; line="${line#data: }"; [[ "$line" == '[DONE]' ]]&&break; jq -e type >/dev/null 2>&1<<<"$line"||continue; printf '%s\n' "$line" >>"$STATE/last-gemini-stream.sse";
+      [[ "$line" == data:\ * ]]||continue; line="${line#data: }"; [[ "$line" == '[DONE]' ]]&&break; jq -e type >/dev/null 2>&1<<<"$line"||continue; printf '%s\n' "$line" >>"$(stpath gemini-stream).sse";
       et="$(jq -r '.event_type//empty'<<<"$line")";
       case "$et" in
         interaction.created) id="$(jq -r '.interaction.id//empty'<<<"$line")";;
         step.start) ((SHOW_STEPS))&&jq -c '{event_type,index,step}'<<<"$line" >&2;;
         step.delta) dt="$(jq -r '.delta.type//empty'<<<"$line")"; case "$dt" in text) jq -r '.delta.text//empty'<<<"$line" | tee -a "$out";; thought_summary) ((SHOW_THINKING||SHOW_STEPS))&&jq -r '.delta.content.text//empty'<<<"$line" >&2;; image|audio|video) data="$(jq -r '.delta.data//empty'<<<"$line")"; mime="$(jq -r '.delta.mime_type//application/octet-stream'<<<"$line")"; [[ -n "$data" ]]&&gemini_save_asset "$data" "$mime" "${id:-asset}" >/dev/null;; arguments_delta) ((SHOW_STEPS))&&jq -r '.delta.arguments//empty'<<<"$line" >&2;; esac;;
-        interaction.completed) id="$(jq -r '.interaction.id//empty'<<<"$line")"; printf '%s\n' "$line">"$STATE/last-gemini-response.json";;
+        interaction.completed) id="$(jq -r '.interaction.id//empty'<<<"$line")"; printf '%s\n' "$line">"$(stpath gemini-response).json";;
         interaction.status_update) ((SHOW_STEPS))&&jq -c .<<<"$line" >&2;;
       esac
-    done < <(gemini_stream_api /interactions -d "$(cat "$STATE/last-gemini-request.json")")
-    response="$(cat "$STATE/last-gemini-response.json" 2>/dev/null)";
+    done < <(gemini_stream_api /interactions -d "$(cat "$(stpath gemini-request).json")")
+    response="$(cat "$(stpath gemini-response).json" 2>/dev/null)";
   else
     response="$(gemini_api /interactions -d "$payload")"; rc=$?; ((rc!=0))&&{ printf '%s\n' 'Gemini request failed' >"$out.stderr"; return "$rc"; }
-    printf '%s\n' "$response">"$STATE/last-gemini-response.json"; id="$(jq -r '.id//empty'<<<"$response")"; status="$(jq -r '.status//empty'<<<"$response")";
+    printf '%s\n' "$response">"$(stpath gemini-response).json"; id="$(jq -r '.id//empty'<<<"$response")"; status="$(jq -r '.status//empty'<<<"$response")";
     if ((bg)) && [[ "$status" == in_progress || "$status" == requires_action ]]; then
-      printf '%s\n' "$id">"$STATE/gemini-background.id";
-      [[ "${AI_GEMINI_DETACH:-false}" == true ]] || { response="$(gemini_poll "$id" 5)" || return 1; printf '%s\n' "$response">"$STATE/last-gemini-response.json"; }
+      printf '%s\n' "$id">"$(stpath gemini-background).id";
+      [[ "${AI_GEMINI_DETACH:-false}" == true ]] || { response="$(gemini_poll "$id" 5)" || return 1; printf '%s\n' "$response">"$(stpath gemini-response).json"; }
     fi
   fi
   [[ -n "$response" ]]||return 3; gemini_record_steps "$response" "$id"; gemini_print_steps "$response"; gemini_save_response_assets "$response" "$id"; gemini_print_stats "$response";
-  [[ -n "$id" ]]&&printf '%s\n' "$id">"$STATE/gemini-interaction-${SESSION//[^A-Za-z0-9_.-]/_}.id";
+  if [[ -n "$id" ]] && { [[ -z "$STATE_TAG" ]] || (( VIEWS <= 1 )); }; then printf '%s\n' "$id">"$STATE/gemini-interaction-${SESSION//[^A-Za-z0-9_.-]/_}.id"; fi
   errmsg="$(jq -r '.error.message//empty'<<<"$response")"; [[ -z "$errmsg" ]]||{ printf '%s\n' "$errmsg">"$out.stderr"; return 21; };
   gemini_extract_output_text<<<"$response">"$out"; [[ -s "$out" ]]||gemini_extract_text<<<"$response">"$out"; return 0;
 }
@@ -387,9 +478,9 @@ gemini_print_stats(){ local r="$1"; ((NO_STATS))&&return 0; jq -r 'if (.usage//n
 
 gemini_get(){ local id="$1"; [[ -n "$id" ]]||id="$(cat "$STATE/gemini-interaction-${SESSION//[^A-Za-z0-9_.-]/_}.id" 2>/dev/null)"; [[ -n "$id" ]]||die 'no Gemini interaction id'; gemini_api "/interactions/$id"; }
 gemini_delete(){ local id="$1"; [[ -n "$id" ]]||die 'interaction id required'; curl -fsS -X DELETE --connect-timeout 5 --max-time "$TIMEOUT" "$(gemini_url "/interactions/$id")" -H "x-goog-api-key: $GEMINI_API_KEY"; }
-gemini_poll(){ local id="$1" interval="${2:-5}" response status; while :; do response="$(gemini_get "$id")"||return; status="$(jq -r '.status//.interaction.status//empty'<<<"$response")"; printf '%s\n' "$response">"$STATE/last-gemini-response.json"; case "$status" in completed|failed|cancelled|incomplete) printf '%s\n' "$response"; return 0;; *) sleep "$interval";; esac; done; }
+gemini_poll(){ local id="$1" interval="${2:-5}" max="${3:-720}" n=0 response status; while ((n<max)); do response="$(gemini_get "$id")"||return; status="$(jq -r '.status//.interaction.status//empty'<<<"$response")"; printf '%s\n' "$response">"$(stpath gemini-response).json"; case "$status" in completed|failed|cancelled|incomplete) printf '%s\n' "$response"; return 0;; *) sleep "$interval";; esac; n=$((n+1)); done; warn "gemini_poll: giving up on $id after $max attempts"; printf '%s\n' "$response"; return 1; }
 
-gemini_research(){ local prompt="$1" agent="${2:-$GEMINI_RESEARCH_AGENT}" out="$STATE/research.txt" response id; response="$(gemini_build_payload "$GEMINI_MODEL" "$prompt" '' 0 1 "$agent" remote)"||return; response="$(gemini_api /interactions -d "$response")"||return; id="$(jq -r '.id//empty'<<<"$response")"; printf '%s\n' "$id">"$STATE/gemini-research.id"; append_json interactions "$(jq -c --arg id "$id" --arg a "$agent" '{interactionId:$id,agent:$a,mode:"background"}')"; while :; do response="$(gemini_get "$id")"||return 1; status="$(jq -r '.status//empty'<<<"$response")"; ((VERBOSE))&&printf '[research] status=%s\n' "$status" >&2; case "$status" in completed|failed|cancelled|incomplete) break;; *) sleep 5;; esac; done; gemini_extract_output_text<<<"$response">"$out"; printf '%s\n' "$response">"$STATE/last-gemini-response.json"; cat "$out"; }
+gemini_research(){ local prompt="$1" agent="${2:-$GEMINI_RESEARCH_AGENT}" out="$STATE/research.txt" response id status n=0; response="$(gemini_build_payload "$GEMINI_MODEL" "$prompt" '' 0 1 "$agent" remote)"||return; response="$(gemini_api /interactions -d "$response")"||return; id="$(jq -r '.id//empty'<<<"$response")"; printf '%s\n' "$id">"$STATE/gemini-research.id"; append_json interactions "$(jq -c --arg id "$id" --arg a "$agent" '{interactionId:$id,agent:$a,mode:"background"}')"; while ((n<720)); do response="$(gemini_get "$id")"||return 1; status="$(jq -r '.status//empty'<<<"$response")"; ((VERBOSE))&&printf '[research] status=%s\n' "$status" >&2; case "$status" in completed|failed|cancelled|incomplete) break;; *) sleep 5;; esac; n=$((n+1)); done; local timed_out=0; ((n>=720))&&{ warn "research: giving up on $id after 720 polls"; timed_out=1; }; gemini_extract_output_text<<<"$response">"$out"; printf '%s\n' "$response">"$(stpath gemini-response).json"; cat "$out"; return "$timed_out"; }
 
 gemini_function_resume(){
   local interaction_id="$1" call_id="$2" name="$3" result="$4" model="${5:-$GEMINI_MODEL}" payload response tools cfg rf='null';
@@ -429,13 +520,15 @@ llama_generate(){
 }
 
 ollama_payload(){
-  local model="$1" prompt="$2" stream="$3" think="$4" format="${5:-none}" schema="${6:-}" images="${7:-[]}";
-  jq -nc --arg m "$model" --arg s "$SYSTEM_PROMPT" --arg p "$prompt" --arg ka "$KEEP_ALIVE" --argjson st "$stream" --arg th "$think" --arg fmt "$format" --argjson imgs "$images" --argjson sch "$(if [[ -n "$schema"&&-f "$schema" ]];then cat "$schema";else echo '{}';fi)" '{model:$m,messages:[{role:"system",content:$s},{role:"user",content:$p}],stream:$st,keep_alive:$ka}|if $th=="auto" then . else .+{think:$th} end|if $fmt=="json" then .+{format:"json"} elif $fmt=="schema" then .+{format:$sch} else . end|if ($imgs|length)>0 then .messages[1].images=$imgs else . end'; }
+  local model="$1" prompt="$2" stream="$3" think="$4" format="${5:-none}" schema="${6:-}" images="${7:-[]}" lp="${8:-0}";
+  jq -nc --arg m "$model" --arg s "$SYSTEM_PROMPT" --arg p "$prompt" --arg ka "$KEEP_ALIVE" --argjson st "$stream" --arg th "$think" --arg fmt "$format" --argjson imgs "$images" --argjson lp "$lp" --argjson tlp "${AI_TOP_LOGPROBS:-5}" --argjson sch "$(if [[ -n "$schema"&&-f "$schema" ]];then cat "$schema";else echo '{}';fi)" '{model:$m,messages:[{role:"system",content:$s},{role:"user",content:$p}],stream:($st==1 or $st==true),keep_alive:$ka}|if $th=="auto" then . else .+{think:($th=="true" or $th=="1")} end|if $fmt=="json" then .+{format:"json"} elif $fmt=="schema" then .+{format:$sch} else . end|if ($imgs|length)>0 then .messages[1].images=$imgs else . end|if ($lp==1 or $lp==true) then .+{logprobs:true,top_logprobs:$tlp} else . end'; }
 
 ollama_generate(){
   local prompt="$1" out="$2" model="$3" format="${4:-none}" schema="${5:-}" images="${6:-[]}";
-  local payload rc response tmp; payload="$(ollama_payload "$model" "$prompt" 0 "$THINK" "$format" "$schema" "$images")" || return 2; printf '%s\n' "$payload" > "$STATE/last-request.json";
-  response="$(printf '%s' "$payload"|curl -fsS --connect-timeout 2 --max-time "$TIMEOUT" "$OLLAMA_HOST/api/chat" -H 'Content-Type: application/json' -d @-)"; rc=$?; ((rc!=0))&&return "$rc"; jq -e '.error' >/dev/null 2>&1<<<"$response"&&{ jq -r '.error'<<<"$response">"$out.stderr"; return 21; }; jq -r '.message.content // empty'<<<"$response">"$out"; printf '%s\n' "$response">"$STATE/last-response.json"; printf '%s\n' "$(entropy_ollama "$response")">"$STATE/last-entropy"; if [[ "$NO_STATS" != 1 ]];then print_ollama_stats "$model" "$response";fi; return 0;
+  local payload rc response lp=0; [[ "$LOGPROBS" == 1 ]] && lp=1;
+  payload="$(ollama_payload "$model" "$prompt" 0 "$THINK" "$format" "$schema" "$images" "$lp")" || return 2; printf '%s\n' "$payload" > "$(stpath request).json";
+  response="$(printf '%s' "$payload"|curl -fsS --connect-timeout 2 --max-time "$TIMEOUT" "$OLLAMA_HOST/api/chat" -H 'Content-Type: application/json' -d @-)"; rc=$?;
+  if ((rc!=0)) && ((lp)); then warn "chat request failed; retrying without logprobs"; lp=0; payload="$(ollama_payload "$model" "$prompt" 0 "$THINK" "$format" "$schema" "$images" 0)" || return 2; printf '%s\n' "$payload" > "$(stpath request).json"; response="$(printf '%s' "$payload"|curl -fsS --connect-timeout 2 --max-time "$TIMEOUT" "$OLLAMA_HOST/api/chat" -H 'Content-Type: application/json' -d @-)"; rc=$?; fi; jq -e '.error' >/dev/null 2>&1<<<"$response"&&{ jq -r '.error'<<<"$response">"$out.stderr"; return 21; }; jq -r '.message.content // empty'<<<"$response">"$out"; printf '%s\n' "$response">"$(stpath response).json"; printf '%s\n' "$(entropy_ollama "$response")">"$(stpath entropy)"; if [[ "$NO_STATS" != 1 ]];then print_ollama_stats "$model" "$response";fi; return 0;
 }
 entropy_ollama(){
   jq -r '
@@ -446,7 +539,7 @@ entropy_ollama(){
       else
         (map(exp)|add) as $z |
         if $z <= 0 then empty
-        else (map(exp/$z)|map(select(.>0)|-(.*(log(.)/log(2))))|add) end
+        else (map(exp/$z)|map(select(.>0)|-(.*log2))|add) end
       end
     ] |
     if length==0 then "NA" else (add/length|tostring) end
@@ -458,7 +551,7 @@ backend_generate(){
   local backend="$1" prompt="$2" out="$3" seed="${4:--1}" model="${5:-}" format="${6:-none}" schema="${7:-}" images="${8:-[]}";
   case "$backend" in
     llama) llama_generate "$prompt" "$out" "$seed";;
-    ollama) [[ -n "$model" ]]||model="$(select_ollama_model "$(classify_task "$prompt")")"; ollama_generate "$prompt" "$out" "$model" "$format" "$schema" "$images";;
+    ollama) if [[ -z "$model" ]]; then model="$(select_ollama_model "$(classify_task "$prompt")")" || return 2; fi; ollama_generate "$prompt" "$out" "$model" "$format" "$schema" "$images";;
     gemini) [[ -n "$model" ]]||model="$(gemini_model_for_task "$(classify_task "$prompt")")"; local prev=""; if [[ "$GEMINI_STATEFUL" == true && "$GEMINI_STORE" == true && "$VIEWS" -le 1 ]]; then prev="$(cat "$STATE/gemini-interaction-${SESSION//[^A-Za-z0-9_.-]/_}.id" 2>/dev/null)"; fi; gemini_generate "$prompt" "$out" "$model" "$seed" "$prev" "$STREAM" "$BACKGROUND" "${AGENT:-}" "${ENVIRONMENT:-}";;
     *) return 2;;
   esac
@@ -489,9 +582,68 @@ VIEW_ROLES=(
  'Adversarial evaluator: challenge the proposed solution with counterexamples and failure modes.'
  'Origin tracer: preserve provenance, hashes, reproducibility, rollback and artifact lineage.'
 )
-parallel_limit(){ if [[ "$PARALLEL" =~ ^[0-9]+$ ]]&&((PARALLEL>0));then echo "$PARALLEL";else local c="$(getconf _NPROCESSORS_ONLN 2>/dev/null||echo 2)"; ((c>4))&&c=4; ((c<1))&&c=1; echo "$c";fi; }
+model_ram_kb(){ # model_ram_kb BACKEND MODEL -> estimated per-process RSS in kB
+  local backend="$1" model="$2" kb
+  if [[ "$AI_MODEL_RAM_GB" =~ ^[0-9]+\.?[0-9]*$ ]];then
+    awk -v g="$AI_MODEL_RAM_GB" 'BEGIN{printf "%d", g*1048576}'; return
+  fi
+  if [[ "$backend" == llama ]];then
+    local dir="${LLAMA_CACHE_DIR:-$HOME/.cache/llama.cpp}" sz=""
+    if [[ -d "$dir" ]];then
+      sz="$(find "$dir" -type f -name '*.gguf' -printf '%s\n' 2>/dev/null | sort -rn | head -1)"
+    fi
+    if [[ "$sz" =~ ^[0-9]+$ ]]&&(( sz > 1048576 ));then
+      awk -v b="$sz" 'BEGIN{printf "%d", b*1.15/1024 + 393216}'  # +384MB KV/runtime headroom
+    else
+      echo 2621440  # conservative default: 3B Q4_K_M class + runtime (~2.5 GB)
+    fi
+  else
+    kb="$(printf '%s\n' "${MODELS[@]}" | awk -F'|' -v m="$model" '$1==m{printf "%d", $3*1048576; exit}')"
+    [[ -n "$kb" ]]||kb=2097152; echo "$kb"
+  fi
+}
+ram_budget_kb(){ # kB usable for AI concurrency right now (balancer-aware)
+  local avail_kb="$(ram_avail_kb)" capped
+  if [[ "$AI_MAX_RAM_GB" != 0 && "$AI_MAX_RAM_GB" =~ ^[0-9]+\.?[0-9]*$ ]];then
+    capped="$(awk -v a="$AI_MAX_RAM_GB" 'BEGIN{printf "%d", a*1048576}')"
+    (( capped > 0 && capped < avail_kb ))&&avail_kb="$capped"
+  fi
+  awk -v a="$avail_kb" -v r="${AI_MEM_RESERVE_KB:-786432}" 'BEGIN{d=a-r; if(d<0)d=0; printf "%d", d}'
+}
+parallel_limit(){ # concurrency bounded by BOTH cpu and RAM-safe ceiling
+  local c="$(getconf _NPROCESSORS_ONLN 2>/dev/null||echo 2)"; ((c>4))&&c=4; ((c<1))&&c=1
+  local backend model per_kb ram_cap cap
+  backend="$(resolve_backend 2>/dev/null||echo llama)"
+  model="$MODEL"; [[ "$backend" == llama ]]&&model="$LLAMA_MODEL"
+  if [[ "$backend" == llama ]];then
+    per_kb="$(model_ram_kb llama "$model")"
+    ram_cap="$(awk -v b="$(ram_budget_kb)" -v p="$per_kb" 'BEGIN{c=b/p; printf "%d", int(c<1?1:c)}')"
+    ((ram_cap>4))&&ram_cap=4
+    if [[ "${AI_MEM_TIER:-}" == critical ]];then ram_cap=1
+    elif [[ "${AI_MEM_TIER:-}" == elevated ]];then ((ram_cap>2))&&ram_cap=2; fi
+    cap=$((ram_cap<c?ram_cap:c))
+  else
+    cap="$c"  # ollama/gemini: one server-side model instance, no per-view copies
+  fi
+  ((cap<1))&&cap=1
+  if [[ "$PARALLEL" =~ ^[0-9]+$ ]]&&((PARALLEL>0));then
+    if ((PARALLEL>cap))&&[[ "${AI_ALLOW_OVERCOMMIT:-0}" != 1 ]];then
+      warn "parallel=$PARALLEL exceeds RAM-safe cap $cap; using $cap (AI_ALLOW_OVERCOMMIT=1 to override)"
+      echo "$cap"
+    else
+      echo "$PARALLEL"
+    fi
+  else
+    echo "$cap"
+  fi
+}
 
-run_view(){ local prompt="$1" idx="$2" out="$3" parent="$4" backend="$5" model="$6"; local seed=$((7919*(idx+1)+7)); local name="${VIEW_NAMES[$idx]}" role="${VIEW_ROLES[$idx]}"; event step.start "$(jq -cn --argjson v "$idx" --arg n "$name" '{view:$v,name:$n}')"; local vp; vp=$(cat<<EOF
+run_view(){
+  # background subshells only get SIGINT auto-ignored; a stray SIGTERM to our
+  # process group (e.g. session close) would kill this subshell instantly and
+  # orphan its llama tree before the cleanup handler can enumerate it
+  trap '' TERM HUP
+  local prompt="$1" idx="$2" out="$3" parent="$4" backend="$5" model="$6"; STATE_TAG="view-$idx"; local seed=$((7919*(idx+1)+7)); local name="${VIEW_NAMES[$idx]}" role="${VIEW_ROLES[$idx]}"; event step.start "$(jq -cn --argjson v "$idx" --arg n "$name" '{view:$v,name:$n}')"; local vp; vp=$(cat<<EOF
 SYSTEM ROLE:
 $role
 
@@ -506,7 +658,7 @@ You are view $((idx+1))/8 at rotation $((idx*45)) degrees. Return conclusions, r
 EOF
 ); if ! backend_generate "$backend" "$vp" "$out" "$seed" "$model" "$FORMAT" "$SCHEMA_FILE" "$IMAGE_B64";then event step.stop "$(jq -cn --argjson v "$idx" '{view:$v,status:"failed"}')"; return 1;fi; local text="$(cat "$out")" h="$(sha256_text "$text")" m="$(md5_text "$text")" metrics="$(score_text "$text")" score="$(awk -v e="$(jq -r .entropy<<<"$metrics")" -v w="$(jq -r .avgTokenWeight<<<"$metrics")" 'BEGIN{printf "%.8f",(e+1)*(w+1)}')"; if [[ "$out" != "$STATE/view-$idx.txt" ]]; then cp "$out" "$STATE/view-$idx.txt"; fi; object_put "$text">/dev/null; append_json traces "$(jq -cn --arg id "$h" --arg m "$m" --arg g "$GENESIS_HASH" --arg p "$parent" --argjson v "$idx" --arg n "$name" --argjson metrics "$metrics" --argjson score "$score" '{type:"model-output",id:$id,md5:$m,genesisHash:$g,parentHash:$p,view:$v,viewName:$n,metrics:$metrics,score:$score,at:now|todate}')"; event step.delta "$(jq -cn --argjson v "$idx" --arg sha "$h" --argjson score "$score" '{view:$v,sha256:$sha,score:$score}')"; event step.stop "$(jq -cn --argjson v "$idx" '{view:$v,status:"completed"}')"; }
 
-synthesize(){ local prompt="$1" parent="$2" backend="$3" model="$4"; local bundle="$STATE/view-bundle.txt" out="$STATE/final.txt"; :>"$bundle"; local f; for f in "$STATE"/view-{0,1,2,3,4,5,6,7}.txt;do [[ -f "$f" ]]||continue; printf '\n=== %s ===\n' "$(basename "$f")">>"$bundle"; cat "$f">>"$bundle";done; local sp; sp=$(cat<<EOF
+synthesize(){ local prompt="$1" parent="$2" backend="$3" model="$4"; STATE_TAG="synthesis"; local bundle="$STATE/view-bundle.txt" out="$STATE/final.txt"; :>"$bundle"; local f; for f in "$STATE"/view-{0,1,2,3,4,5,6,7}.txt;do [[ -f "$f" ]]||continue; printf '\n=== %s ===\n' "$(basename "$f")">>"$bundle"; cat "$f">>"$bundle";done; local sp; sp=$(cat<<EOF
 You are the deterministic synthesis stage of a local multi-view software agent.
 Original task:
 $prompt
@@ -516,9 +668,9 @@ $(cat "$bundle")
 
 Select the strongest evidence-backed conclusions. Resolve contradictions explicitly. Produce the final implementation/result, not hidden chain-of-thought. Include verification steps and preserve important constraints.
 EOF
-); event step.start '{"stage":"synthesis"}'; backend_generate "$backend" "$sp" "$out" 991948 "$model" || return 1; local text="$(cat "$out")" h="$(sha256_text "$text")" m="$(md5_text "$text")" metrics="$(score_text "$text")"; append_json traces "$(jq -cn --arg id "$h" --arg m "$m" --arg g "$GENESIS_HASH" --arg p "$parent" --argjson metrics "$metrics" '{type:"synthesis",id:$id,md5:$m,genesisHash:$g,parentHash:$p,metrics:$metrics,at:now|todate}')"; event interaction.completed "$(jq -cn --arg sha "$h" '{finalSha256:$sha}')"; cat "$out"; }
+); event step.start '{"stage":"synthesis"}'; ((NO_STATS))||printf 'ai-fusion: synthesis (final pass) starting\n' >&2; ( trap '' TERM HUP; backend_generate "$backend" "$sp" "$out" 991948 "$model" "$FORMAT" "$SCHEMA_FILE" ) & local _spid=$!; wait "$_spid" || { STATE_TAG=""; return 1; }; STATE_TAG=""; local text="$(cat "$out")" h="$(sha256_text "$text")" m="$(md5_text "$text")" metrics="$(score_text "$text")"; append_json traces "$(jq -cn --arg id "$h" --arg m "$m" --arg g "$GENESIS_HASH" --arg p "$parent" --argjson metrics "$metrics" '{type:"synthesis",id:$id,md5:$m,genesisHash:$g,parentHash:$p,metrics:$metrics,at:now|todate}')"; event interaction.completed "$(jq -cn --arg sha "$h" '{finalSha256:$sha}')"; }
 
-run_prompt(){ local raw="$*"; parse_envelope "$raw"; [[ -n "$PROMPT" ]]||die 'empty prompt'; ensure_session; genesis_new>/dev/null; local backend="$(resolve_backend)" task="$(classify_task "$PROMPT")" model="$MODEL"; if [[ "$backend" == ollama && -z "$model" ]];then model="$(select_ollama_model "$task")";fi; [[ "$backend" == llama ]]&&model="$LLAMA_MODEL"; local inputHash="$(sha256_text "$PROMPT")" originHash="$(md5_text "$GENESIS_HASH|$PROMPT")" taskId="$(sha256_text "$GENESIS_HASH|$originHash|$inputHash")"; append_json tasks "$(jq -cn --arg id "$taskId" --arg input "$inputHash" --arg origin "$originHash" --arg g "$GENESIS_HASH" --arg b "$backend" --arg model "$model" --arg task "$task" --arg p "$PROMPT" '{taskId:$id,sha256:$input,originHash:$origin,genesisHash:$g,backend:$b,model:$model,taskClass:$task,prompt:$p,at:now|todate}')"; event step.start "$(jq -cn --arg id "$taskId" --arg b "$backend" --arg m "$model" '{stage:"task",taskId:$id,backend:$b,model:$m}')"; ((VIEWS<1))&&VIEWS=1; ((VIEWS>8))&&VIEWS=8; local limit="$(parallel_limit)"; local pids=() i out; :>"$STATE/view-bundle.txt"; for ((i=0;i<VIEWS;i++));do out="$STATE/view-$i.txt"; while (( $(jobs -rp|wc -l) >= limit ));do wait -n 2>/dev/null||true;done; run_view "$PROMPT" "$i" "$out" "$taskId" "$backend" "$model" & pids+=("$!"); done; local rc=0 pid; for pid in "${pids[@]}";do wait "$pid"||rc=1;done; ((rc==0))||die 'one or more views failed'; jq -s 'map(select(.type=="model-output"))|sort_by(-.score)' "$DB/traces.jsonl">"$STATE/last-ranking.json"; event step.stop "$(jq -cn --arg id "$taskId" --argjson v "$VIEWS" '{stage:"ranking",taskId:$id,views:$v}')"; if [[ "$SYNTHESIS" == 1 || "$SYNTHESIS" == true ]];then synthesize "$PROMPT" "$taskId" "$backend" "$model";else cat "$STATE/view-0.txt";fi; append_session user "$PROMPT"; append_session assistant "$(cat "$STATE/final.txt" 2>/dev/null||cat "$STATE/view-0.txt")"; }
+run_prompt(){ local raw="$*"; if ((RAW_PROMPT)); then PROMPT="$raw"; else parse_envelope "$raw"; fi; [[ -n "$PROMPT" ]]||die 'empty prompt'; ensure_session; genesis_new>/dev/null; local backend="$(resolve_backend)" task="$(classify_task "$PROMPT")" model="$MODEL"; if [[ "$backend" == ollama && -z "$model" ]];then model="$(select_ollama_model "$task")"||die 'model selection failed';fi; [[ "$backend" == llama ]]&&model="$LLAMA_MODEL"; SELECTED_MODEL="$model"; if ((STREAM))&&[[ "$backend" != gemini ]]; then warn 'streaming is gemini-only; ignoring --stream'; STREAM=0; fi; if [[ "$backend" == llama ]];then local _per_kb _avail_kb; _per_kb="$(model_ram_kb llama "$LLAMA_MODEL")"; _avail_kb="$(ram_avail_kb)"; if (( _avail_kb < _per_kb + 262144 ));then die "insufficient RAM for llama backend: need ~$(( (_per_kb+262144)/1024 ))MB free, have $((_avail_kb/1024))MB â€” free memory, switch backend, or use a smaller AI_MODEL"; fi; fi; if [[ "$backend" == llama ]]&&((VIEWS>1)); then warn "llama backend: RAM guard -> $(parallel_limit)/$VIEWS views concurrent (~$(awk -v k="$(model_ram_kb llama "$LLAMA_MODEL")" 'BEGIN{printf "%.1f",k/1048576}')GB/view, budget $(awk -v k="$(ram_budget_kb)" 'BEGIN{printf "%.1f",k/1048576}')GB)"; fi; local inputHash="$(sha256_text "$PROMPT")" originHash="$(md5_text "$GENESIS_HASH|$PROMPT")" taskId="$(sha256_text "$GENESIS_HASH|$originHash|$inputHash")"; append_json tasks "$(jq -cn --arg id "$taskId" --arg input "$inputHash" --arg origin "$originHash" --arg g "$GENESIS_HASH" --arg b "$backend" --arg model "$model" --arg task "$task" --arg p "$PROMPT" '{taskId:$id,sha256:$input,originHash:$origin,genesisHash:$g,backend:$b,model:$model,taskClass:$task,prompt:$p,at:now|todate}')"; event step.start "$(jq -cn --arg id "$taskId" --arg b "$backend" --arg m "$model" '{stage:"task",taskId:$id,backend:$b,model:$m}')"; rm -f "$STATE"/view-{0,1,2,3,4,5,6,7}.txt "$STATE/final.txt"; ((VIEWS<1))&&VIEWS=1; ((VIEWS>8))&&VIEWS=8; local limit="$(parallel_limit)"; local pids=() i out _t0; :>"$STATE/view-bundle.txt"; _ai_view_pids=(); trap '_ai_sig_cleanup INT' INT; trap '_ai_sig_cleanup TERM' TERM; trap '_ai_sig_cleanup HUP' HUP; _t0="$(date +%s)"; ((NO_STATS))||printf 'ai-fusion: %s views, %s concurrent â€” Ctrl+C aborts all views\n' "$VIEWS" "$limit" >&2; for ((i=0;i<VIEWS;i++));do out="$STATE/view-$i.txt"; while (( $(jobs -rp|wc -l) >= limit ));do wait -n 2>/dev/null||sleep 1; done; ((NO_STATS))||printf 'ai-fusion: view %d/%d (%s) started\n' $((i+1)) "$VIEWS" "${VIEW_NAMES[$i]}" >&2; run_view "$PROMPT" "$i" "$out" "$taskId" "$backend" "$model" >/dev/null 2>"$STATE/view-$i.txt.stderr" & pids+=("$!"); _ai_view_pids+=("$!"); done; local rc=0 pid; for pid in "${pids[@]}";do wait "$pid"||rc=1;done; _ai_view_pids=(); ((NO_STATS))||printf 'ai-fusion: all views complete in %ss\n' "$(( $(date +%s) - _t0 ))" >&2; if ((rc!=0));then local _e; for _e in "$STATE"/view-*.txt.stderr;do [[ -s "$_e" ]]&&{ printf '%s\n' "--- tail: $_e ---" >&2; tail -n 3 "$_e" >&2; };done; die 'one or more views failed'; fi; jq -s --arg p "$taskId" 'map(select(.type=="model-output" and .parentHash==$p))|sort_by(-.score)' "$DB/traces.jsonl">"$STATE/last-ranking.json"; event step.stop "$(jq -cn --arg id "$taskId" --argjson v "$VIEWS" '{stage:"ranking",taskId:$id,views:$v}')"; local final_out rc2=0; if [[ "$SYNTHESIS" == 1 || "$SYNTHESIS" == true ]]; then synthesize "$PROMPT" "$taskId" "$backend" "$model"||rc2=1; final_out="$(cat "$STATE/final.txt" 2>/dev/null||true)"; else final_out="$(cat "$STATE/view-0.txt")"; fi; ((rc2))&&die 'synthesis failed'; printf '%s\n' "$final_out"; append_session user "$PROMPT"; append_session assistant "$final_out"; trap - INT TERM HUP; }
 
 # -----------------------------------------------------------------------------
 # WebKit/HTML5 coder agent + validator + repair loop
@@ -526,7 +678,7 @@ run_prompt(){ local raw="$*"; parse_envelope "$raw"; [[ -n "$PROMPT" ]]||die 'em
 validate_html(){ local f="$1"; grep -qi '<!doctype html' "$f"||return 10; grep -qi '<html' "$f"||return 11; grep -qi '<head' "$f"||return 12; grep -qi '<body' "$f"||return 13; grep -qi '</html>' "$f"||return 14; local js; js="$(sed -n '/<script\b/,/<\/script>/p' "$f"|sed '1d;$d')"; if [[ -n "$js" ]]&&command -v node >/dev/null 2>&1;then printf '%s\n' "$js">"$STATE/.validate.js"; node --check "$STATE/.validate.js" >/dev/null 2>&1||return 15;fi; local css; css="$(sed -n '/<style\b/,/<\/style>/p' "$f"|sed '1d;$d')"; [[ "$(printf '%s' "$css"|tr -cd '{'|wc -c)" == "$(printf '%s' "$css"|tr -cd '}'|wc -c)" ]]||return 16; return 0; }
 validate_file(){ local f="$1" ext rc=0; [[ -f "$f" ]]||die "file not found: $f"; ext="${f##*.}"; case "$ext" in sh|bash) bash -n "$f";; js|mjs|cjs) command -v node >/dev/null 2>&1||die node required; node --check "$f";; json) jq empty "$f";; html|htm) validate_html "$f";; css) [[ "$(tr -cd '{' <"$f"|wc -c)" == "$(tr -cd '}'<"$f"|wc -c)" ]];; *) return 0;; esac; rc=$?; if ((rc==0));then jq -cn --arg path "$f" --arg ext "$ext" '{path:$path,extension:$ext,status:"valid",diagnostics:"static syntax/structure gate passed"}';else jq -cn --arg path "$f" --arg ext "$ext" --argjson rc "$rc" '{path:$path,extension:$ext,status:"invalid",exitCode:$rc}';fi; return "$rc"; }
 extract_html(){ local src="$1"; sed -n '/<!doctype html>/I,/<\/html>/Ip' "$src"; }
-webkit_prompt(){ local request="$*"; [[ -n "$request" ]]||die 'webkit requires a prompt'; local backend="$(resolve_backend)" model="$MODEL"; [[ "$backend" == ollama&&-z "$model" ]]&&model="$(select_ollama_model coder)"; [[ "$backend" == llama ]]&&model="$LLAMA_MODEL"; local prompt; prompt=$(cat<<EOF
+webkit_prompt(){ local request="$*"; [[ -n "$request" ]]||die 'webkit requires a prompt'; local backend="$(resolve_backend)" model="$MODEL"; if [[ "$backend" == ollama && -z "$model" ]]; then model="$(select_ollama_model coder)" || die "model selection failed"; fi; [[ "$backend" == llama ]]&&model="$LLAMA_MODEL"; local prompt; prompt=$(cat<<EOF
 Act as a WebKit-compatible HTML5 coder agent.
 Build ONE complete standalone HTML5 document for this request:
 $request
@@ -543,7 +695,7 @@ Hard contract:
 - no pseudocode or TODO placeholders
 EOF
 ); local tmp="$(mktemp)" out="$STATE/webkit.html"; backend_generate "$backend" "$prompt" "$tmp" 424242 "$model"||die "generation failed: $(tail -n 5 "$tmp.stderr" 2>/dev/null)"; extract_html "$tmp">"$out"; [[ -s "$out" ]]||cp "$tmp" "$out"; local round=0; while ((round<3));do if validate_html "$out";then cp "$out" "$BASE/ai-generated-$(date +%Y%m%d-%H%M%S).html"; cat "$out"; rm -f "$tmp"; return 0;fi; round=$((round+1)); fix_file "$out" "Repair this HTML5 document so it passes the static WebKit/HTML5 gate. Preserve all intended features. Return the complete document only." || break; done; rm -f "$tmp"; die 'generated HTML did not pass validation'; }
-fix_file(){ local f="$1" request="${2:-Repair syntax and preserve behavior.}"; [[ -f "$f" ]]||die "file not found: $f"; local backend="$(resolve_backend)" model="$MODEL"; [[ "$backend" == ollama&&-z "$model" ]]&&model="$(select_ollama_model coder)"; [[ "$backend" == llama ]]&&model="$LLAMA_MODEL"; local source="$(cat "$f")" prompt; prompt=$(cat<<EOF
+fix_file(){ local f="$1" request="${2:-Repair syntax and preserve behavior.}"; [[ -f "$f" ]]||die "file not found: $f"; local backend="$(resolve_backend)" model="$MODEL"; if [[ "$backend" == ollama && -z "$model" ]]; then model="$(select_ollama_model coder)" || die "model selection failed"; fi; [[ "$backend" == llama ]]&&model="$LLAMA_MODEL"; local source="$(cat "$f")" prompt; prompt=$(cat<<EOF
 You are a strict local code repair agent.
 Repair the following source according to this request:
 $request
@@ -558,7 +710,7 @@ Rules:
 SOURCE:
 $source
 EOF
-); local tmp="$(mktemp)"; backend_generate "$backend" "$prompt" "$tmp" 818181 "$model"||die "repair generation failed"; local repaired="$tmp".clean; if [[ "${f##*.}" =~ html?|htm ]];then extract_html "$tmp">"$repaired";else sed '/^```/d' "$tmp">"$repaired";fi; validate_file "$repaired" >/dev/null || { warn "repair still fails validation"; rm -f "$tmp" "$repaired"; return 1; }; cp -a "$f" "$f.ai-before-fix.$(date +%s)"; mv "$repaired" "$f"; index_file "$f"; printf '%s\n' "$f"; rm -f "$tmp"; }
+); local tmp="$(mktemp)"; backend_generate "$backend" "$prompt" "$tmp" 818181 "$model"||die "repair generation failed"; local repaired="$tmp.${f##*.}"; if [[ "${f##*.}" =~ html?|htm ]];then extract_html "$tmp">"$repaired";else sed '/^```/d' "$tmp">"$repaired";fi; validate_file "$repaired" >/dev/null || { warn "repair still fails validation"; rm -f "$tmp" "$repaired"; return 1; }; cp -a "$f" "$f.ai-before-fix.$(date +%s)"; mv "$repaired" "$f"; index_file "$f"; printf '%s\n' "$f"; rm -f "$tmp"; }
 
 # -----------------------------------------------------------------------------
 # Ollama bridges / diagnostics / reference
@@ -570,10 +722,11 @@ cmd_pull(){ api /api/pull -H 'Content-Type: application/json' -d "$(jq -nc --arg
 cmd_delete(){ api /api/delete -H 'Content-Type: application/json' -d "$(jq -nc --arg n "$1" '{name:$n}')"|jq .; }
 cmd_copy(){ api /api/copy -H 'Content-Type: application/json' -d "$(jq -nc --arg s "$1" --arg d "$2" '{source:$s,destination:$d}')"|jq .; }
 reference(){ if llama_available;then "$LLAMA_BIN" --help>"$REFS/llama-help.txt" 2>&1||true; "$LLAMA_BIN" cli -h>"$REFS/llama-cli-help.txt" 2>&1||true; fi; if ollama_up;then api /api/version>"$REFS/ollama-version.json" 2>/dev/null||true; api /api/tags>"$REFS/ollama-tags.json" 2>/dev/null||true;fi; jq -n --arg backend "$BACKEND" --arg at "$(now)" '{type:"runtime-reference",backend:$backend,capturedAt:$at}'; }
-doctor(){ local b=unavailable; if llama_available;then b=llama;elif ollama_up;then b=ollama;fi; printf 'version=%s\nbackend=%s\nbash=%s\njq=%s\ncurl=%s\nllama=%s\nollama=%s\ngemini=%s\nram_available_gb=%s\nram_total_gb=%s\nthreads=%s\nviews=%s\nparallel=%s\n' "$VERSION" "$b" "$BASH_VERSION" "$(jq --version)" "$(curl --version|head -1)" "$(command -v "$LLAMA_BIN" 2>/dev/null||echo missing)" "$(ollama_up&&echo up||echo down)" "$(gemini_available&&echo configured||echo missing)" "$(ram_avail_gb)" "$(ram_total_gb)" "$THREADS" "$VIEWS" "$(parallel_limit)"; }
+doctor(){ local b=unavailable; if llama_available;then b=llama;elif ollama_up;then b=ollama;elif gemini_available;then b=gemini;fi; printf 'version=%s\nbackend=%s\nbash=%s\njq=%s\ncurl=%s\nllama=%s\nollama=%s\ngemini=%s\nram_available_gb=%s\nram_total_gb=%s\nmodel_ram_gb=%s\nram_budget_gb=%s\nmem_tier=%s\nthreads=%s\nviews=%s\nparallel=%s\n' "$VERSION" "$b" "$BASH_VERSION" "$(jq --version)" "$(curl --version|head -1)" "$(command -v "$LLAMA_BIN" 2>/dev/null||echo missing)" "$(ollama_up&&echo up||echo down)" "$(gemini_available&&echo configured||echo missing)" "$(ram_avail_gb)" "$(ram_total_gb)" "$(awk -v k="$(model_ram_kb llama "$LLAMA_MODEL")" 'BEGIN{printf "%.2f",k/1048576}')" "$(awk -v k="$(ram_budget_kb)" 'BEGIN{printf "%.2f",k/1048576}')" "${AI_MEM_TIER:-unset}" "$THREADS" "$VIEWS" "$(parallel_limit)"; }
 
+do_reset(){ rm -f "$STATE"/view-*.txt "$STATE"/view-*.txt.stderr "$STATE"/final.txt "$STATE"/final.txt.stderr "$STATE"/last-*.json "$STATE"/last-entropy "$STATE"/last-gemini-stream*.sse "$STATE"/genesis.hash "$STATE"/gemini-interaction-*.id "$STATE"/gemini-background*.id "$STATE"/gemini-research.id "$STATE"/tools-cli.json "$STATE"/file-search-tools.json; rm -f "$STATE/sessions/"*.json 2>/dev/null||true; printf 'ai-fusion: session state reset (ledger preserved)\n' >&2; }
 usage(){ cat<<EOF
-ai-fusion.sh $VERSION — llama.cpp + Ollama local agent fusion
+ai-fusion.sh $VERSION â€” llama.cpp + Ollama local agent fusion
 
 CORE
   run PROMPT | prompt PROMPT       2PI/8 multiview execution
@@ -599,7 +752,7 @@ BACKENDS
 
 PERFORMANCE
   --views N                       1..8 perspectives (default 8)
-  --parallel N                    bounded concurrent views (default auto, max 4)
+  --parallel N                    bounded concurrent views (default auto: RAM+CPU aware)
   --threads N                     llama threads (default 8)
   --ctx N                         llama context
   --gpu-layers N                  llama GPU layers
@@ -662,6 +815,11 @@ ENV
   AI_OLLAMA_MODEL=qwen3.5:4b
   OLLAMA_HOST=http://127.0.0.1:11434
   AI_VIEWS=8 AI_PARALLEL=0 AI_THREADS=8 AI_CTX=4096
+  AI_MODEL_RAM_GB=2.0            per-process llama RAM estimate override
+  AI_MEM_RESERVE_KB=786432       RAM kept away from AI concurrency
+  AI_MEM_TIER=nominal|elevated|critical  (set by .bashrc balancer)
+  AI_ALLOW_OVERCOMMIT=1          allow --parallel above the RAM-safe cap
+  AI_LOGPROBS=1 AI_TOP_LOGPROBS=5
 EOF
 }
 status(){ jq -cn --arg v "$VERSION" --arg b "$BACKEND" --arg gm "$GEMINI_MODEL" --arg ga "$GEMINI_AGENT" --arg llama "$LLAMA_BIN" --arg om "$OLLAMA_HOST" --arg g "$(genesis_current)" --argjson views "$VIEWS" --argjson threads "$THREADS" --argjson parallel "$(parallel_limit)" '{name:"loopshape-ai-fusion",version:$v,backend:$b,geminiModel:$gm,geminiAgent:$ga,llama:$llama,ollama:$om,genesisHash:$g,views:$views,threads:$threads,parallel:$parallel}'; }
@@ -676,7 +834,7 @@ cmd="$1"; shift
 case "$cmd" in
   -h|--help|help) usage;;
   -v|--version|version) echo "$VERSION";;
-  doctor) doctor;; status) status;; reference) reference;;
+  doctor) doctor;; status) status;; reference) reference;; reset|--reset) do_reset;;
   agents) gemini_agents | jq .;;
   agent-get) gemini_agent_get "${1:-}" | jq .;;
   agent-delete) gemini_agent_delete "${1:-}" | jq .;;
@@ -714,7 +872,7 @@ case "$cmd" in
   webkit|html|html5|build-html) webkit_prompt "$*";;
   agent) mode="${1:-}";shift||true; case "$mode" in --mode) mode="${1:-}";shift;; esac; case "$mode" in webkit) webkit_prompt "$*";; fix) fix_file "${1:-}" "${*:2}";; validate) validate_file "${1:-}";; gemini|antigravity|deep-research) BACKEND=gemini; AGENT="$GEMINI_AGENT"; [[ "$mode" == deep-research ]]&&AGENT="$GEMINI_RESEARCH_AGENT"; ENVIRONMENT="${ENVIRONMENT:-remote}"; run_prompt "$*";; *) die 'agent mode: webkit|fix|validate|gemini|antigravity|deep-research';; esac;;
   run|prompt) # option-aware prompt mode
-    while (($#));do case "$1" in --backend) BACKEND="${2:?backend}";shift 2;; --gemini) BACKEND=gemini;shift;; --auto) BACKEND=auto;shift;; --model|-m) MODEL="${2:?model}";EXPLICIT=1;shift 2;; --ollama-model) OLLAMA_MODEL="${2:?model}";shift 2;; --views) VIEWS="${2:?views}";shift 2;; --parallel) PARALLEL="${2:?parallel}";shift 2;; --threads) THREADS="${2:?threads}";shift 2;; --ctx) CTX="${2:?ctx}";shift 2;; --gpu-layers) GPU_LAYERS="${2:?layers}";shift 2;; --temp) TEMP="${2:?temp}";shift 2;; --top-p) TOP_P="${2:?top-p}";shift 2;; --top-k) TOP_K="${2:?top-k}";shift 2;; --think) THINK="${2:?think}";shift 2;; --session) SESSION="${2:?session}";shift 2;; --no-synthesis) SYNTHESIS=false;shift;; --timeout) TIMEOUT="${2:?timeout}";shift 2;; --stream) STREAM=1;shift;; --file) UPLOAD_FILE="${2:?file}"; PROMPT="$(cat "$UPLOAD_FILE")";shift 2;; --image) local_img="${2:?image}"; [[ -f "$local_img" ]]||die "image not found: $local_img"; UPLOAD_FILE="$local_img"; MIME_TYPE="$(gemini_mime "$local_img")"; if command -v base64 >/dev/null 2>&1;then IMAGE_B64="["$(base64 -w0 "$local_img" 2>/dev/null || base64 "$local_img"|tr -d '\n')"]"; fi; shift 2;; --json) FORMAT=json;shift;; --schema) FORMAT=schema;SCHEMA_FILE="${2:?schema}";shift 2;; --generation-config) GENERATION_CONFIG_FILE="${2:?generation-config}";shift 2;; --tools) TOOLS_FILE="${2:?tools}";shift 2;; --background) BACKGROUND=1;shift;; --agent) AGENT="${2:?agent}";BACKEND=gemini;shift 2;; --agent-config) AGENT_CONFIG_FILE="${2:?agent config}";BACKEND=gemini;shift 2;; --system) AGENT_SYSTEM="${2:?system instruction}";shift 2;; --environment) ENVIRONMENT="${2:?environment}";shift 2;; --environment-json) ENVIRONMENT_JSON_FILE="${2:?environment json}";shift 2;; --google-search) enable_gemini_tool google_search;shift;; --google-maps) enable_gemini_tool google_maps;shift;; --code-execution) enable_gemini_tool code_execution;shift;; --url-context) enable_gemini_tool url_context;shift;; --computer-use) enable_gemini_tool computer_use;shift;; --image-output) FORMAT=image;BACKEND=gemini;shift;; --audio-output) FORMAT=audio;BACKEND=gemini;shift;; --video-output) FORMAT=video;BACKEND=gemini;shift;; --music-output) FORMAT=audio;MUSIC_OUTPUT=1;BACKEND=gemini;shift;; --image-size) IMAGE_SIZE="${2:?image size}";shift 2;; --aspect-ratio) IMAGE_ASPECT_RATIO="${2:?aspect ratio}";VIDEO_ASPECT_RATIO="$IMAGE_ASPECT_RATIO";shift 2;; --video-resolution) VIDEO_RESOLUTION="${2:?video resolution}";shift 2;; --thinking-level) GEMINI_THINKING_LEVEL="${2:?thinking level}";shift 2;; --service-tier) GEMINI_SERVICE_TIER="${2:?service tier}";shift 2;; --show-steps) SHOW_STEPS=1;shift;; --show-thinking) SHOW_THINKING=1;shift;; --unload) UNLOAD=1;KEEP_ALIVE=0;shift;; --verbose|-v) VERBOSE=1;shift;; --) shift;break;; *) break;; esac;done; [[ -n "$PROMPT" ]]||PROMPT="$*"; run_prompt "$PROMPT"; rc=$?; if ((UNLOAD))&&[[ "$(resolve_backend 2>/dev/null || echo '')" == ollama ]];then curl -fsS --connect-timeout 2 --max-time 10 "$OLLAMA_HOST/api/generate" -H 'Content-Type: application/json' -d "$(jq -nc --arg m "${MODEL:-$OLLAMA_MODEL}" '{model:$m,prompt:"",keep_alive:0}')" >/dev/null 2>&1||true;fi; exit "$rc";;
+    while (($#));do case "$1" in --backend) BACKEND="${2:?backend}";shift 2;; --gemini) BACKEND=gemini;shift;; --auto) BACKEND=auto;shift;; --model|-m) MODEL="${2:?model}";EXPLICIT=1;shift 2;; --ollama-model) OLLAMA_MODEL="${2:?model}";shift 2;; --views) VIEWS="${2:?views}";shift 2;; --parallel) PARALLEL="${2:?parallel}";shift 2;; --threads) THREADS="${2:?threads}";shift 2;; --ctx) CTX="${2:?ctx}";shift 2;; --gpu-layers) GPU_LAYERS="${2:?layers}";shift 2;; --temp) TEMP="${2:?temp}";shift 2;; --top-p) TOP_P="${2:?top-p}";shift 2;; --top-k) TOP_K="${2:?top-k}";shift 2;; --think) THINK="${2:?think}";shift 2;; --session) SESSION="${2:?session}";shift 2;; --no-synthesis) SYNTHESIS=false;shift;; --timeout) TIMEOUT="${2:?timeout}";shift 2;; --stream) STREAM=1;shift;; --file) UPLOAD_FILE="${2:?file}"; PROMPT="$(cat "$UPLOAD_FILE")"; RAW_PROMPT=1; UPLOAD_FILE=""; shift 2;; --image) local_img="${2:?image}"; [[ -f "$local_img" ]]||die "image not found: $local_img"; UPLOAD_FILE="$local_img"; MIME_TYPE="$(gemini_mime "$local_img")"; if command -v base64 >/dev/null 2>&1;then img_b64="$(base64 -w0 "$local_img" 2>/dev/null || base64 "$local_img"|tr -d '\n')"; IMAGE_B64="[\"$img_b64\"]"; fi; shift 2;; --json) FORMAT=json;shift;; --schema) FORMAT=schema;SCHEMA_FILE="${2:?schema}";shift 2;; --generation-config) GENERATION_CONFIG_FILE="${2:?generation-config}";shift 2;; --tools) TOOLS_FILE="${2:?tools}";shift 2;; --background) BACKGROUND=1;shift;; --agent) AGENT="${2:?agent}";BACKEND=gemini;shift 2;; --agent-config) AGENT_CONFIG_FILE="${2:?agent config}";BACKEND=gemini;shift 2;; --system) AGENT_SYSTEM="${2:?system instruction}";shift 2;; --environment) ENVIRONMENT="${2:?environment}";shift 2;; --environment-json) ENVIRONMENT_JSON_FILE="${2:?environment json}";shift 2;; --google-search) enable_gemini_tool google_search;shift;; --google-maps) enable_gemini_tool google_maps;shift;; --code-execution) enable_gemini_tool code_execution;shift;; --url-context) enable_gemini_tool url_context;shift;; --computer-use) enable_gemini_tool computer_use;shift;; --image-output) FORMAT=image;BACKEND=gemini;shift;; --audio-output) FORMAT=audio;BACKEND=gemini;shift;; --video-output) FORMAT=video;BACKEND=gemini;shift;; --music-output) FORMAT=audio;MUSIC_OUTPUT=1;BACKEND=gemini;shift;; --image-size) IMAGE_SIZE="${2:?image size}";shift 2;; --aspect-ratio) IMAGE_ASPECT_RATIO="${2:?aspect ratio}";VIDEO_ASPECT_RATIO="$IMAGE_ASPECT_RATIO";shift 2;; --video-resolution) VIDEO_RESOLUTION="${2:?video resolution}";shift 2;; --thinking-level) GEMINI_THINKING_LEVEL="${2:?thinking level}";shift 2;; --service-tier) GEMINI_SERVICE_TIER="${2:?service tier}";shift 2;; --show-steps) SHOW_STEPS=1;shift;; --show-thinking) SHOW_THINKING=1;shift;; --unload) UNLOAD=1;KEEP_ALIVE=0;shift;; --verbose|-v) VERBOSE=1;shift;; --reset) do_reset; exit 0;; --) shift;break;; *) break;; esac;done; [[ -n "$PROMPT" ]]||PROMPT="$*"; run_prompt "$PROMPT"; rc=$?; if ((UNLOAD))&&[[ "$(resolve_backend 2>/dev/null || echo '')" == ollama ]];then curl -fsS --connect-timeout 2 --max-time 10 "$OLLAMA_HOST/api/generate" -H 'Content-Type: application/json' -d "$(jq -nc --arg m "${SELECTED_MODEL:-${MODEL:-$OLLAMA_MODEL}}" '{model:$m,prompt:"",keep_alive:0}')" >/dev/null 2>&1||true;fi; exit "$rc";;
   llama) llama_available||die 'llama binary missing'; "$LLAMA_BIN" "$@";;
   cli) llama_available||die 'llama binary missing'; "$LLAMA_BIN" cli "$@";;
   gemini) BACKEND=gemini; run_prompt "$*";;
