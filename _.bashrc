@@ -392,3 +392,16 @@ fi
 # -----------------------------------------------------------------------------
 # End ~/.bashrc v13.0.0
 # =============================================================================
+
+source /home/loop/.env.local/bin/activate
+
+eval $(ssh-agent -s)
+ssh-add
+cd ~
+
+clear
+screenfetch
+free -h
+df -h
+
+echo "Shell setup done."
