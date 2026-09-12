@@ -2,7 +2,7 @@
 
 # Define strict internal absolute pathing matching your framework specs
 SCRIPT_DIR="$HOME/_/qwen_cli"
-SCRIPT_PATH="$SCRIPT_DIR/cli_chat_final.py"
+SCRIPT_PATH="$SCRIPT_DIR/cli_chat.py"
 
 # Enforce active working directory containment context
 cd "$SCRIPT_DIR" || exit 1

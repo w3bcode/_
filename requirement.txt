@@ -8,3 +8,7 @@ ethereum
 flask
 autopep8
 huggingface_hub
+bip39
+bip85
+gTTS
+pydub
