@@ -2364,7 +2364,7 @@ cmd_chat() {
 cmd_help() {
     cat <<'EOF'
 
-ai.sh 10.0.0
+ai.sh 16.0.0
 Bulletproof direct-GGUF local AI controller.
 
 USAGE
