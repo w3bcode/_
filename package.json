@@ -6,7 +6,7 @@
     "online"
   ],
   "author": "Loop",
-  "type": "node",
+  "type": "module",
   "main": "server.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"

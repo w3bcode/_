@@ -1,69 +1,185 @@
 #!/usr/bin/env bash
 # =============================================================================
-# ai.sh v17.0.0
+# ai.sh v16.4.0
 # =============================================================================
-# Single-file local AI controller for llama.cpp.
+# Single-file local AI controller for llama.cpp (llama-cli), tuned for
+# proot-distro Debian on Android with modest RAM (~16GB or less).
 #
-# PRIMARY RUNTIME CONTRACT:
-#
-#   llama cli -m /path/model.gguf
-#
-# Prompt is always delivered through stdin.
+# Runtime:
+#   $HOME/.local/bin/llama   (override with LLAMA_CLI)
 #
 # Architecture:
 #
-#   input
-#     |
-#     +--> normalize
-#     +--> genesis SHA256
-#     +--> task SHA256
-#     |
-#     +--> sequential 2PI / 8 POV
-#     |      0°   analytical
-#     |     45°   architectural
-#     |     90°   critical
-#     |    135°   creative
-#     |    180°   implementation
-#     |    225°   adversarial
-#     |    270°   systems
-#     |    315°   synthesis
-#     |
-#     +--> candidate scoring
-#     +--> optional synthesis
-#     +--> optional recursive continuation
-#     |
-#     +--> SHA256 object ledger
-#     +--> sandboxed file CRUD
-#     +--> file index
+#   prompt
+#      |
+#      v
+#   normalization
+#      |
+#      v
+#   genesis SHA-256
+#      |
+#      v
+#   task hash
+#      |
+#      v
+#   2PI / 8 POV multiview  (sequential â€” safe for constrained RAM)
+#      |
+#      +---- analytical
+#      +---- architectural
+#      +---- critical
+#      +---- creative
+#      +---- implementation
+#      +---- adversarial
+#      +---- systems
+#      +---- synthesis
+#      |
+#      v
+#   candidate scoring
+#      |
+#      v
+#   convergence / consensus
+#      |
+#      v
+#   optional synthesis
+#      |
+#      v
+#   recursive continuation
+#      |
+#      v
+#   SHA-256 content-addressed ledger  (JSON, $OBJECT_DIR)
+#      |
+#      v
+#   sandboxed file CRUD + queryable index  ($FILE_ROOT, $DB_DIR/file_index.json)
 #
-# Designed for:
-#   Android / Termux / Debian proot / ARM64
+# Model policy:
 #
-# No Ollama dependency.
-# No HTTP inference dependency.
-# No logical model identifier is passed to llama.
+#   PRIMARY
+#     Qwen2.5-Coder-3B-Instruct Q4_K_M
 #
+#   FALLBACK
+#     Qwen2.5-1.5B-Instruct Q4_K_M
+#
+# IMPORTANT:
+#   - Logical model identifiers are NEVER passed to llama.
+#     Only verified physical GGUF files are passed through --model.
+#   - "ai file" CRUD operations are sandboxed under FILE_ROOT by default.
+#     See `ai help` / FILE ACCESS section for how to opt out.
+#
+# Requires: bash, awk, sed, grep, find, sort, jq, bc, sha256sum (or shasum),
+#           curl (only for `ai install`). All are standard on Debian/apt.
 # =============================================================================
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+#!/usr/bin/env bash
+# =============================================================================
+# route_llama_cli.sh - Llama CLI Pipeline Router & Model Resolver
+# Location: /home/loop/_/bin/route_llama_cli.sh
+# =============================================================================
+set -Eeuo pipefail
+
+AI_HOME="${AI_HOME:-$HOME/.ai}"
+MODEL_DIR="${MODEL_DIR:-$AI_HOME/models}"
+TARGET_MODEL="${MODEL_PATH:-models/llama-2-7b-chat.gguf}"
+
+# 1. Resolve llama-cli Executable Path
+resolve_llama_bin() {
+    local candidates=("llama-cli" "llama-cpp-cli" "main" "llama-run")
+    for bin in "${candidates[@]}"; do
+        if command -v "$bin" &>/dev/null; then
+            command -v "$bin"
+            return 0
+        elif [[ -x "$AI_HOME/bin/$bin" ]]; then
+            echo "$AI_HOME/bin/$bin"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 2. Resolve Valid GGUF Model File
+resolve_model_file() {
+    local req_model="$1"
+
+    # Explicit file match
+    if [[ -f "$req_model" ]]; then
+        echo "$req_model"
+        return 0
+    fi
+
+    # Check standard model store directories
+    if [[ -f "$MODEL_DIR/$req_model" ]]; then
+        echo "$MODEL_DIR/$req_model"
+        return 0
+    fi
+
+    # Fallback auto-discovery for any available .gguf model
+    local discovered
+    discovered="$(find "$MODEL_DIR" "$AI_HOME" "$HOME/_" /home/loop/_ -maxdepth 3 -name "*.gguf" 2>/dev/null | head -n 1 || true)"
+
+    if [[ -n "$discovered" && -f "$discovered" ]]; then
+        echo "$discovered"
+        return 0
+    fi
+
+    return 1
+}
+
+# 3. Execution Pipeline Router
+route_pipeline() {
+    local prompt="${1:-}"
+    local tokens="${N_PREDICT:-128}"
+    local threads="${LLAMA_THREADS:-4}"
+    local ctx="${CTX_SIZE:-2048}"
+
+    if [[ -z "$prompt" ]]; then
+        echo "[ROUTER_ERR] Prompt stream empty." >&2
+        return 1
+    fi
+
+    local bin_path
+    if ! bin_path="$(resolve_llama_bin)"; then
+        printf "[ROUTER_FALLBACK] No llama-cli binary detected in PATH or %s/bin.\n" "$AI_HOME"
+        printf "[MOCK_GENESIS_STREAM] Echo tokenstream for prompt: '%s'\n" "$prompt"
+        return 0
+    fi
+
+    local model_path
+    if ! model_path="$(resolve_model_file "$TARGET_MODEL")"; then
+        printf "[ROUTER_FALLBACK] GGUF weight missing at '%s'. No models found in %s.\n" "$TARGET_MODEL" "$MODEL_DIR"
+        printf "[MOCK_GENESIS_STREAM] Simulated response for prompt: '%s'\n" "$prompt"
+        return 0
+    fi
+
+    # Direct execution of localized binary pipeline
+    "$bin_path" \
+        -m "$model_path" \
+        -p "$prompt" \
+        -n "$tokens" \
+        -c "$ctx" \
+        -t "$threads" \
+        --temp 0.7 \
+        --no-display-prompt \
+        2>/dev/null
+}
+
+route_pipeline "$@"
+
 # =============================================================================
 # VERSION
 # =============================================================================
 
-AI_VERSION="17.0.0"
+AI_VERSION="16.4.0"
 
 # =============================================================================
-# PATHS
+# BASE PATHS
 # =============================================================================
 
+AI_HOME="${AI_HOME:-${HOME:-/root}/.ai}"
 HOME_DIR="${HOME:-/root}"
 
-AI_HOME="${AI_HOME:-$HOME_DIR/.ai}"
 STATE_DIR="${AI_STATE_DIR:-$AI_HOME/.ai-state}"
-
-MODEL_DIR="${AI_MODEL_DIR:-$AI_HOME/models}"
 
 CACHE_DIR="${AI_CACHE_DIR:-$STATE_DIR/cache}"
 LOG_DIR="${AI_LOG_DIR:-$STATE_DIR/logs}"
@@ -73,15 +189,13 @@ REFERENCE_DIR="${AI_REFERENCE:-$DB_DIR/reference}"
 RUN_DIR="${AI_RUN_DIR:-$STATE_DIR/run}"
 SESSION_DIR="${AI_SESSION_DIR:-$STATE_DIR/sessions}"
 
-FILE_ROOT="${AI_FILE_ROOT:-$AI_HOME/files}"
-FILE_INDEX="$DB_DIR/file_index.json"
+MODEL_DIR="${AI_MODEL_DIR:-$AI_HOME/models}"
 
+# Fixed-path error channel for subshell execution recovery
 LAST_ERROR_FILE="$RUN_DIR/last_error.log"
 
 mkdir -p \
-    "$AI_HOME" \
     "$STATE_DIR" \
-    "$MODEL_DIR" \
     "$CACHE_DIR" \
     "$LOG_DIR" \
     "$DB_DIR" \
@@ -89,52 +203,56 @@ mkdir -p \
     "$REFERENCE_DIR" \
     "$RUN_DIR" \
     "$SESSION_DIR" \
-    "$FILE_ROOT"
+    "$MODEL_DIR"
 
 # =============================================================================
-# LLAMA RUNTIME
+# RUNTIME
 # =============================================================================
 
-LLAMA_CLI="${LLAMA_CLI:-$HOME_DIR/.local/bin/llama}"
+LLAMA_CLI="${LLAMA_CLI:-${HOME:-/root}/.local/bin/llama}"
 
 # =============================================================================
-# MODEL CONFIGURATION
+# MODEL IDENTITIES
 # =============================================================================
 
 AI_MODEL="${AI_MODEL:-Qwen/Qwen2.5-Coder-3B-Instruct-GGUF:Q4_K_M}"
 AI_CODER="${AI_CODER:-$AI_MODEL}"
 AI_FALLBACK="${AI_FALLBACK:-Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M}"
 
+# Physical overrides.
 AI_MODEL_PATH="${AI_MODEL_PATH:-}"
 AI_FALLBACK_PATH="${AI_FALLBACK_PATH:-}"
 
+# Local filenames.
 AI_PRIMARY_FILE="${AI_PRIMARY_FILE:-qwen2.5-coder-3b-instruct-q4_k_m.gguf}"
 AI_FALLBACK_FILE="${AI_FALLBACK_FILE:-qwen2.5-1.5b-instruct-q4_k_m.gguf}"
 
 PRIMARY_LOCAL_PATH="$MODEL_DIR/$AI_PRIMARY_FILE"
 FALLBACK_LOCAL_PATH="$MODEL_DIR/$AI_FALLBACK_FILE"
 
+# HF cache.
 AI_HF_ROOT="${AI_HF_ROOT:-$HOME_DIR/.cache/huggingface/hub}"
 
 PRIMARY_HF_CACHE="$AI_HF_ROOT/models--Qwen--Qwen2.5-Coder-3B-Instruct-GGUF"
 FALLBACK_HF_CACHE="$AI_HF_ROOT/models--Qwen--Qwen2.5-1.5B-Instruct-GGUF"
 
+# HF repositories.
 PRIMARY_HF_REPO="Qwen/Qwen2.5-Coder-3B-Instruct-GGUF"
 FALLBACK_HF_REPO="Qwen/Qwen2.5-1.5B-Instruct-GGUF"
 
 # =============================================================================
-# INFERENCE
+# RUNTIME PARAMETERS
 # =============================================================================
 
-AI_CONTEXT="${AI_CONTEXT:-4096}"
-AI_BATCH="${AI_BATCH:-256}"
-AI_UBATCH="${AI_UBATCH:-128}"
-AI_PREDICT="${AI_PREDICT:-512}"
+AI_CONTEXT="${AI_CONTEXT:-${AI_CTX:-4096}}"
+AI_BATCH="${AI_BATCH:-${AI_BATCH_SIZE:-256}}"
+AI_UBATCH="${AI_UBATCH:-${AI_UBATCH_SIZE:-128}}"
+AI_PREDICT="${AI_PREDICT:-${AI_N_PREDICT:-512}}"
 
 AI_THREADS="${AI_THREADS:-8}"
 AI_GPU_LAYERS="${AI_GPU_LAYERS:-0}"
 
-AI_TEMPERATURE="${AI_TEMPERATURE:-0.65}"
+AI_TEMPERATURE="${AI_TEMPERATURE:-${AI_TEMP:-0.65}}"
 AI_TOP_K="${AI_TOP_K:-40}"
 AI_TOP_P="${AI_TOP_P:-0.95}"
 AI_REPEAT_PENALTY="${AI_REPEAT_PENALTY:-1.10}"
@@ -147,11 +265,21 @@ AI_TIMEOUT="${AI_TIMEOUT:-600}"
 
 AI_VIEWS="${AI_VIEWS:-8}"
 AI_DEPTH="${AI_DEPTH:-1}"
+
 AI_SYNTHESIS="${AI_SYNTHESIS:-false}"
+AI_STREAM="${AI_STREAM:-false}"
 
 AI_SESSION="${AI_SESSION:-default}"
 
+# Minimum useful answer length.
 AI_MIN_OUTPUT="${AI_MIN_OUTPUT:-8}"
+
+# Candidate scoring weights.
+AI_SCORE_LENGTH="${AI_SCORE_LENGTH:-0.20}"
+AI_SCORE_STRUCTURE="${AI_SCORE_STRUCTURE:-0.20}"
+AI_SCORE_DIRECTNESS="${AI_SCORE_DIRECTNESS:-0.20}"
+AI_SCORE_HASH="${AI_SCORE_HASH:-0.10}"
+AI_SCORE_COMPLETENESS="${AI_SCORE_COMPLETENESS:-0.30}"
 
 # =============================================================================
 # COLORS
@@ -162,41 +290,56 @@ if [[ -t 1 ]]; then
     C_RED=$'\033[31m'
     C_GREEN=$'\033[32m'
     C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+    C_MAGENTA=$'\033[35m'
     C_CYAN=$'\033[36m'
+    C_WHITE=$'\033[37m'
     C_DIM=$'\033[2m'
 else
     C_RESET=""
     C_RED=""
     C_GREEN=""
     C_YELLOW=""
+    C_BLUE=""
+    C_MAGENTA=""
     C_CYAN=""
+    C_WHITE=""
     C_DIM=""
 fi
 
 # =============================================================================
-# GLOBAL STATE
+# GLOBALS
 # =============================================================================
 
 CURRENT_MODEL_PATH=""
 CURRENT_MODEL_NAME=""
 CURRENT_MODEL_TIER=""
 
-GENESIS_HASH=""
-TASK_HASH=""
-CURRENT_HASH=""
-
 LAST_OUTPUT=""
 LAST_ERROR=""
 LAST_EXIT_CODE=0
 
+GENESIS_HASH=""
+TASK_HASH=""
+CURRENT_HASH=""
+
+POV_INDEX=0
+POV_NAME=""
+POV_ANGLE=""
+
+LLAMA_HELP_CACHE=""
+LLAMA_SUBCOMMAND_CACHE=""
+
+declare -a LLAMA_CMD=()
 declare -a CANDIDATE_FILES=()
 declare -a CANDIDATE_SCORES=()
 declare -a CANDIDATE_HASHES=()
-declare -a TMP_FILES=()
 
 # =============================================================================
-# SIGNAL / CLEANUP
+# CLEANUP
 # =============================================================================
+
+TMP_FILES=()
 
 cleanup() {
     local f
@@ -208,21 +351,41 @@ cleanup() {
 }
 
 trap cleanup EXIT
-
 trap 'printf "\n[INTERRUPTED]\n" >&2; exit 130' INT TERM
 
 # =============================================================================
-# OUTPUT
+# ERROR HANDLER
 # =============================================================================
 
-info() {
-    printf '%s[AI]%s %s\n' \
-        "$C_CYAN" "$C_RESET" "$*" >&2
+on_error() {
+    local rc=$?
+    local line="${BASH_LINENO[0]:-unknown}"
+    local cmd="${BASH_COMMAND:-unknown}"
+
+    printf '%s[ERROR]%s line=%s rc=%s\n' \
+        "$C_RED" "$C_RESET" "$line" "$rc" >&2
+
+    printf '%sCOMMAND:%s %s\n' \
+        "$C_DIM" "$C_RESET" "$cmd" >&2
+
+    if [[ -f "$LAST_ERROR_FILE" ]] && have stat && have date; then
+        local age=$(( $(date +%s) - $(stat -c %Y "$LAST_ERROR_FILE" 2>/dev/null || echo 0) ))
+        (( age >= 0 && age <= 3 )) && show_last_error
+    fi
+
+    exit "$rc"
 }
 
-ok() {
-    printf '%s[OK]%s %s\n' \
-        "$C_GREEN" "$C_RESET" "$*"
+trap on_error ERR
+
+# =============================================================================
+# BASIC UTILITIES
+# =============================================================================
+
+die() {
+    printf '%s[ERROR]%s %s\n' \
+        "$C_RED" "$C_RESET" "$*" >&2
+    exit 1
 }
 
 warn() {
@@ -230,10 +393,14 @@ warn() {
         "$C_YELLOW" "$C_RESET" "$*" >&2
 }
 
-die() {
-    printf '%s[ERROR]%s %s\n' \
-        "$C_RED" "$C_RESET" "$*" >&2
-    exit 1
+info() {
+    printf '%s[AI]%s %s\n' \
+        "$C_CYAN" "$C_RESET" "$*"
+}
+
+ok() {
+    printf '%s[OK]%s %s\n' \
+        "$C_GREEN" "$C_RESET" "$*"
 }
 
 debug() {
@@ -246,55 +413,40 @@ debug() {
 show_last_error() {
     [[ -f "$LAST_ERROR_FILE" ]] || return 0
 
-    printf '%s[LLAMA ERROR]%s\n' \
-        "$C_RED" "$C_RESET" >&2
-
+    printf '%s[LLAMA ERROR]%s\n' "$C_RED" "$C_RESET" >&2
     sed 's/^/  /' "$LAST_ERROR_FILE" >&2
 }
 
-# =============================================================================
-# UTILITIES
-# =============================================================================
-
 have() {
     command -v "$1" >/dev/null 2>&1
+}
+
+now_ms() {
+    if date +%s%3N >/dev/null 2>&1; then
+        date +%s%3N
+    else
+        printf '%s000\n' "$(date +%s)"
+    fi
 }
 
 now_iso() {
     date -u '+%Y-%m-%dT%H:%M:%SZ'
 }
 
-safe_tmp() {
-    local prefix="${1:-ai}"
-    local file
-
-    if have mktemp; then
-        file="$(mktemp "$RUN_DIR/${prefix}.XXXXXX")"
-    else
-        file="$RUN_DIR/${prefix}.$$.$RANDOM"
-        : > "$file"
-    fi
-
-    TMP_FILES+=("$file")
-
-    printf '%s\n' "$file"
-}
+# =============================================================================
+# VALIDATION
+# =============================================================================
 
 is_uint() {
-    [[ "${1:-}" =~ ^[0-9]+$ ]]
+    [[ "$1" =~ ^[0-9]+$ ]]
 }
 
 require_uint() {
     local name="$1"
     local value="$2"
 
-    is_uint "$value" ||
-        die "$name must be an unsigned integer: $value"
+    is_uint "$value" || die "$name must be an unsigned integer: $value"
 }
-
-# =============================================================================
-# CONFIG VALIDATION
-# =============================================================================
 
 validate_config() {
     require_uint AI_CONTEXT "$AI_CONTEXT"
@@ -306,33 +458,20 @@ validate_config() {
     require_uint AI_VIEWS "$AI_VIEWS"
     require_uint AI_DEPTH "$AI_DEPTH"
 
-    (( AI_CONTEXT > 0 )) ||
-        die "AI_CONTEXT must be > 0"
-
-    (( AI_BATCH > 0 )) ||
-        die "AI_BATCH must be > 0"
-
-    (( AI_UBATCH > 0 )) ||
-        die "AI_UBATCH must be > 0"
-
-    (( AI_PREDICT > 0 )) ||
-        die "AI_PREDICT must be > 0"
-
-    (( AI_THREADS > 0 )) ||
-        die "AI_THREADS must be > 0"
-
-    (( AI_TIMEOUT > 0 )) ||
-        die "AI_TIMEOUT must be > 0"
-
+    (( AI_CONTEXT > 0 )) || die "AI_CONTEXT must be > 0"
+    (( AI_BATCH > 0 )) || die "AI_BATCH must be > 0"
+    (( AI_UBATCH > 0 )) || die "AI_UBATCH must be > 0"
+    (( AI_PREDICT > 0 )) || die "AI_PREDICT must be > 0"
+    (( AI_THREADS > 0 )) || die "AI_THREADS must be > 0"
     (( AI_VIEWS >= 1 && AI_VIEWS <= 8 )) ||
-        die "AI_VIEWS must be 1..8"
+        die "AI_VIEWS must be between 1 and 8"
 
     (( AI_DEPTH >= 1 && AI_DEPTH <= 32 )) ||
-        die "AI_DEPTH must be 1..32"
+        die "AI_DEPTH must be between 1 and 32"
 }
 
 # =============================================================================
-# HASH
+# HASHING
 # =============================================================================
 
 sha256_string() {
@@ -352,7 +491,7 @@ sha256_string() {
         return
     fi
 
-    die "sha256sum or shasum required"
+    die "sha256sum or shasum is required"
 }
 
 sha256_file() {
@@ -372,11 +511,11 @@ sha256_file() {
         return
     fi
 
-    die "sha256sum or shasum required"
+    die "sha256sum or shasum is required"
 }
 
 # =============================================================================
-# JSON
+# JSON ESCAPE
 # =============================================================================
 
 json_escape() {
@@ -392,20 +531,41 @@ json_escape() {
 }
 
 # =============================================================================
-# GGUF
+# FILE UTILITIES
+# =============================================================================
+
+safe_tmp() {
+    local prefix="${1:-ai}"
+
+    local tmp
+
+    if have mktemp; then
+        tmp="$(mktemp "$RUN_DIR/${prefix}.XXXXXX")"
+    else
+        tmp="$RUN_DIR/${prefix}.$$.$RANDOM"
+        : > "$tmp"
+    fi
+
+    TMP_FILES+=("$tmp")
+
+    printf '%s\n' "$tmp"
+}
+
+# =============================================================================
+# GGUF VALIDATION
 # =============================================================================
 
 is_valid_gguf() {
     local file="$1"
-    local magic
+    local magic=""
 
     [[ -f "$file" ]] || return 1
     [[ -s "$file" ]] || return 1
 
     magic="$(
         head -c 4 "$file" 2>/dev/null |
-            od -An -tc |
-            tr -d '[:space:]'
+        LC_ALL=C od -An -tc |
+        tr -d '[:space:]'
     )"
 
     [[ "$magic" == "GGUF" ]]
@@ -415,7 +575,7 @@ verify_gguf() {
     local file="$1"
 
     if ! is_valid_gguf "$file"; then
-        warn "invalid GGUF: $file"
+        warn "Invalid GGUF: $file"
         return 1
     fi
 
@@ -423,18 +583,18 @@ verify_gguf() {
 }
 
 # =============================================================================
-# MODEL SEARCH
+# MODEL DISCOVERY
 # =============================================================================
 
 find_exact_gguf() {
     local root="$1"
-    local name="$2"
+    local filename="$2"
 
     [[ -d "$root" ]] || return 1
 
     find "$root" \
         -type f \
-        -iname "$name" \
+        -iname "$filename" \
         -print \
         -quit \
         2>/dev/null
@@ -447,7 +607,7 @@ find_any_gguf() {
 
     find "$root" \
         -type f \
-        -iname '*.gguf' \
+        \( -iname '*.gguf' -o -iname '*.GGUF' \) \
         -print \
         2>/dev/null |
         sort |
@@ -455,28 +615,32 @@ find_any_gguf() {
 }
 
 # =============================================================================
-# MODEL RESOLUTION
+# PRIMARY MODEL
 # =============================================================================
 
 find_primary_model() {
     local model=""
 
+    # Explicit path.
     if [[ -n "$AI_MODEL_PATH" &&
           -f "$AI_MODEL_PATH" &&
           -s "$AI_MODEL_PATH" ]]; then
 
         verify_gguf "$AI_MODEL_PATH" || return 1
+
         printf '%s\n' "$AI_MODEL_PATH"
         return 0
     fi
 
-    if [[ -f "$PRIMARY_LOCAL_PATH" ]] &&
-       verify_gguf "$PRIMARY_LOCAL_PATH"; then
-
-        printf '%s\n' "$PRIMARY_LOCAL_PATH"
-        return 0
+    # Dedicated local registry.
+    if [[ -f "$PRIMARY_LOCAL_PATH" ]]; then
+        if verify_gguf "$PRIMARY_LOCAL_PATH"; then
+            printf '%s\n' "$PRIMARY_LOCAL_PATH"
+            return 0
+        fi
     fi
 
+    # Another matching local GGUF.
     model="$(
         find_exact_gguf \
             "$MODEL_DIR" \
@@ -484,13 +648,14 @@ find_primary_model() {
             true
     )"
 
-    if [[ -n "$model" ]] &&
-       verify_gguf "$model"; then
-
-        printf '%s\n' "$model"
-        return 0
+    if [[ -n "$model" && -f "$model" ]]; then
+        if verify_gguf "$model"; then
+            printf '%s\n' "$model"
+            return 0
+        fi
     fi
 
+    # HF cache.
     model="$(
         find_exact_gguf \
             "$PRIMARY_HF_CACHE" \
@@ -498,46 +663,53 @@ find_primary_model() {
             true
     )"
 
-    if [[ -n "$model" ]] &&
-       verify_gguf "$model"; then
-
-        printf '%s\n' "$model"
-        return 0
+    if [[ -n "$model" && -f "$model" ]]; then
+        if verify_gguf "$model"; then
+            printf '%s\n' "$model"
+            return 0
+        fi
     fi
 
+    # Any GGUF in primary repository cache.
     model="$(
-        find_any_gguf \
-            "$PRIMARY_HF_CACHE" ||
-            true
+        find_any_gguf "$PRIMARY_HF_CACHE" ||
+        true
     )"
 
-    if [[ -n "$model" ]] &&
-       verify_gguf "$model"; then
-
-        printf '%s\n' "$model"
-        return 0
+    if [[ -n "$model" && -f "$model" ]]; then
+        if verify_gguf "$model"; then
+            printf '%s\n' "$model"
+            return 0
+        fi
     fi
 
     return 1
 }
 
+# =============================================================================
+# FALLBACK MODEL
+# =============================================================================
+
 find_fallback_model() {
     local model=""
 
+    # Explicit path.
     if [[ -n "$AI_FALLBACK_PATH" &&
           -f "$AI_FALLBACK_PATH" &&
           -s "$AI_FALLBACK_PATH" ]]; then
 
         verify_gguf "$AI_FALLBACK_PATH" || return 1
+
         printf '%s\n' "$AI_FALLBACK_PATH"
         return 0
     fi
 
-    if [[ -f "$FALLBACK_LOCAL_PATH" ]] &&
-       verify_gguf "$FALLBACK_LOCAL_PATH"; then
-
-        printf '%s\n' "$FALLBACK_LOCAL_PATH"
-        return 0
+    # Dedicated local registry.
+    if [[ -f "$FALLBACK_LOCAL_PATH" ]]; then
+        if verify_gguf "$FALLBACK_LOCAL_PATH"; then
+            printf '%s\n' "$FALLBACK_LOCAL_PATH"
+            return 0
+        fi
     fi
 
     model="$(
@@ -547,13 +719,14 @@ find_fallback_model() {
             true
     )"
 
-    if [[ -n "$model" ]] &&
-       verify_gguf "$model"; then
-
-        printf '%s\n' "$model"
-        return 0
+    if [[ -n "$model" && -f "$model" ]]; then
+        if verify_gguf "$model"; then
+            printf '%s\n' "$model"
+            return 0
+        fi
     fi
 
+    # HF cache.
     model="$(
         find_exact_gguf \
             "$FALLBACK_HF_CACHE" \
@@ -561,28 +734,31 @@ find_fallback_model() {
             true
     )"
 
-    if [[ -n "$model" ]] &&
-       verify_gguf "$model"; then
-
-        printf '%s\n' "$model"
-        return 0
+    if [[ -n "$model" && -f "$model" ]]; then
+        if verify_gguf "$model"; then
+            printf '%s\n' "$model"
+            return 0
+        fi
     fi
 
     model="$(
-        find_any_gguf \
-            "$FALLBACK_HF_CACHE" ||
-            true
+        find_any_gguf "$FALLBACK_HF_CACHE" ||
+        true
     )"
 
-    if [[ -n "$model" ]] &&
-       verify_gguf "$model"; then
-
-        printf '%s\n' "$model"
-        return 0
+    if [[ -n "$model" && -f "$model" ]]; then
+        if verify_gguf "$model"; then
+            printf '%s\n' "$model"
+            return 0
+        fi
     fi
 
     return 1
 }
+
+# =============================================================================
+# MODEL RESOLUTION
+# =============================================================================
 
 resolve_model() {
     local model=""
@@ -617,182 +793,309 @@ resolve_model() {
 }
 
 # =============================================================================
-# RUNTIME
+# RUNTIME CAPABILITIES
 # =============================================================================
 
 check_runtime() {
     [[ -x "$LLAMA_CLI" ]] || {
         LAST_ERROR="llama runtime is not executable: $LLAMA_CLI"
-        printf '%s\n' "$LAST_ERROR" > "$LAST_ERROR_FILE"
         return 127
     }
 
     return 0
 }
 
+llama_help() {
+    if [[ -z "$LLAMA_HELP_CACHE" ]]; then
+        LLAMA_HELP_CACHE="$(
+            "$LLAMA_CLI" cli --help 2>&1 ||
+            "$LLAMA_CLI" --help 2>&1 ||
+            true
+        )"
+    fi
+
+    printf '%s\n' "$LLAMA_HELP_CACHE"
+}
+
+llama_supports() {
+    local option="$1"
+
+    llama_help |
+        grep -Eq -- \
+            "(^|[[:space:]])${option}([=[:space:]]|,|$)"
+}
+
+llama_uses_cli_subcommand() {
+    if [[ -z "$LLAMA_SUBCOMMAND_CACHE" ]]; then
+        if "$LLAMA_CLI" cli --help >/dev/null 2>&1; then
+            LLAMA_SUBCOMMAND_CACHE="yes"
+        else
+            LLAMA_SUBCOMMAND_CACHE="no"
+        fi
+    fi
+
+    [[ "$LLAMA_SUBCOMMAND_CACHE" == "yes" ]]
+}
+
 # =============================================================================
-# LLAMA EXECUTION
+# BUILD LLAMA COMMAND
 # =============================================================================
-#
-# v17 deliberately uses:
-#
-#   llama cli -m MODEL
-#
-# and sends the complete prompt to stdin.
-#
-# This avoids:
-#
-#   --prompt "$huge_string"
-#
-# and:
-#
-#   --file "$temporary_file"
-#
-# which vary between llama.cpp builds.
-#
+
+build_llama_command() {
+    local model="$1"
+
+    # HARD MODEL INVARIANT.
+    [[ -n "$model" ]] || {
+        LAST_ERROR="empty model path"
+        return 2
+    }
+
+    [[ -f "$model" ]] || {
+        LAST_ERROR="model does not exist: $model"
+        return 2
+    }
+
+    [[ -s "$model" ]] || {
+        LAST_ERROR="model is empty: $model"
+        return 2
+    }
+
+    verify_gguf "$model" || {
+        LAST_ERROR="invalid GGUF: $model"
+        return 2
+    }
+
+    LLAMA_CMD=("$LLAMA_CLI")
+    llama_uses_cli_subcommand && LLAMA_CMD+=(cli)
+    LLAMA_CMD+=(--model "$model")
+
+    # Context.
+    if llama_supports '--ctx-size'; then
+        LLAMA_CMD+=(--ctx-size "$AI_CONTEXT")
+    elif llama_supports '-c'; then
+        LLAMA_CMD+=(-c "$AI_CONTEXT")
+    fi
+
+    # Batch.
+    if llama_supports '--batch-size'; then
+        LLAMA_CMD+=(--batch-size "$AI_BATCH")
+    elif llama_supports '-b'; then
+        LLAMA_CMD+=(-b "$AI_BATCH")
+    fi
+
+    # UBatch.
+    if llama_supports '--ubatch-size'; then
+        LLAMA_CMD+=(--ubatch-size "$AI_UBATCH")
+    fi
+
+    # Prediction.
+    if llama_supports '--predict'; then
+        LLAMA_CMD+=(--predict "$AI_PREDICT")
+    elif llama_supports '-n'; then
+        LLAMA_CMD+=(-n "$AI_PREDICT")
+    fi
+
+    # Threads.
+    if llama_supports '--threads'; then
+        LLAMA_CMD+=(--threads "$AI_THREADS")
+    elif llama_supports '-t'; then
+        LLAMA_CMD+=(-t "$AI_THREADS")
+    fi
+
+    # Temperature.
+    if llama_supports '--temp'; then
+        LLAMA_CMD+=(--temp "$AI_TEMPERATURE")
+    fi
+
+    # Top K.
+    if llama_supports '--top-k'; then
+        LLAMA_CMD+=(--top-k "$AI_TOP_K")
+    fi
+
+    # Top P.
+    if llama_supports '--top-p'; then
+        LLAMA_CMD+=(--top-p "$AI_TOP_P")
+    fi
+
+    # Repeat penalty.
+    if llama_supports '--repeat-penalty'; then
+        LLAMA_CMD+=(--repeat-penalty "$AI_REPEAT_PENALTY")
+    fi
+
+    # GPU.
+    if [[ "$AI_GPU_LAYERS" != "0" ]]; then
+        if llama_supports '--n-gpu-layers'; then
+            LLAMA_CMD+=(--n-gpu-layers "$AI_GPU_LAYERS")
+        elif llama_supports '-ngl'; then
+            LLAMA_CMD+=(-ngl "$AI_GPU_LAYERS")
+        fi
+    fi
+
+    return 0
+}
+
+# =============================================================================
+# RAW LLAMA EXECUTION
 # =============================================================================
 
 run_llama() {
-    local prompt="${1:-}"
+    local prompt="$1"
     local model="${2:-}"
-    local stderr_file
-    local output
-    local rc
-    local -a cmd
+    local output=""
+    local rc=0
+    local stderr_file=""
 
     LAST_OUTPUT=""
     LAST_ERROR=""
     LAST_EXIT_CODE=0
 
-    [[ -n "$prompt" ]] || {
-        LAST_ERROR="empty prompt"
-        printf '%s\n' "$LAST_ERROR" > "$LAST_ERROR_FILE"
-        LAST_EXIT_CODE=2
-        return 2
-    }
-
     check_runtime || {
         LAST_EXIT_CODE=$?
-        printf '%s\n' "$LAST_ERROR" > "$LAST_ERROR_FILE" 2>/dev/null || true
         return "$LAST_EXIT_CODE"
     }
 
+    # Resolve automatically if model wasn't explicitly supplied.
     if [[ -z "$model" || ! -f "$model" ]]; then
         model="$(resolve_model || true)"
     fi
 
+    # NEVER invoke llama with an unresolved model.
     if [[ -z "$model" || ! -f "$model" ]]; then
-        LAST_ERROR="no physical GGUF model resolved"
+        LAST_ERROR="No physical GGUF model resolved."
         LAST_EXIT_CODE=2
 
-        {
-            printf '[%s] exit=2\n' "$(now_iso)"
-            printf '%s\n' "$LAST_ERROR"
-            printf 'MODEL_DIR=%s\n' "$MODEL_DIR"
-            printf 'HF_CACHE=%s\n' "$AI_HF_ROOT"
-        } > "$LAST_ERROR_FILE"
+        warn "$LAST_ERROR"
+        warn "Model registry: $MODEL_DIR"
+        warn "HF cache:      $AI_HF_ROOT"
 
         return 2
     fi
 
     verify_gguf "$model" || {
-        LAST_ERROR="invalid GGUF: $model"
+        LAST_ERROR="Resolved model is not a valid GGUF: $model"
         LAST_EXIT_CODE=2
-        printf '%s\n' "$LAST_ERROR" > "$LAST_ERROR_FILE"
         return 2
     }
 
-    # -------------------------------------------------------------------------
-    # HARD RUNTIME CONTRACT
-    # -------------------------------------------------------------------------
+    build_llama_command "$model" || {
+        LAST_EXIT_CODE=$?
+        return "$LAST_EXIT_CODE"
+    }
 
-    cmd=(
-        "$LLAMA_CLI"
-        cli
-        -m "$model"
-    )
+    local prompt_file
+    prompt_file="$(safe_tmp llama-prompt)"
+    printf '%s' "$prompt" > "$prompt_file"
 
-    # -------------------------------------------------------------------------
-    # Optional flags.
-    #
-    # These are intentionally supplied only when explicitly enabled through
-    # AI_LLAMA_FLAGS. The base invocation remains universally compatible with
-    # the user's known-good `llama cli -m MODEL` runtime.
-    #
-    # Example:
-    #
-    # AI_LLAMA_FLAGS='--ctx-size 4096 --threads 8 --temp 0.65'
-    #
-    # -------------------------------------------------------------------------
-
-    if [[ -n "${AI_LLAMA_FLAGS:-}" ]]; then
-        # shellcheck disable=SC2206
-        local extra_flags=( $AI_LLAMA_FLAGS )
-        cmd+=("${extra_flags[@]}")
+    local approx_tokens=$(( ${#prompt} / 4 ))
+    if (( approx_tokens > AI_CONTEXT )); then
+        warn "Prompt is ~${approx_tokens} tokens but AI_CONTEXT=$AI_CONTEXT;" \
+             "it will likely be truncated. Scan fewer files or raise AI_CONTEXT."
     fi
 
-    stderr_file="$(safe_tmp llama-stderr)"
+    local attempt
+    local flipped_once="false"
 
-    if [[ "${AI_VERBOSE:-false}" == "true" ]]; then
-        printf '%sCOMMAND:%s' \
-            "$C_DIM" "$C_RESET" >&2
+    for (( attempt = 1; attempt <= 2; attempt++ )); do
+        if (( attempt > 1 )); then
+            build_llama_command "$model" || {
+                LAST_EXIT_CODE=$?
+                return "$LAST_EXIT_CODE"
+            }
+        fi
 
-        printf ' %q' "${cmd[@]}" >&2
-        printf '\n' >&2
-    fi
+        if llama_supports '--file'; then
+            LLAMA_CMD+=(--file "$prompt_file")
+        elif llama_supports '-f'; then
+            LLAMA_CMD+=(-f "$prompt_file")
+        else
+            local prompt_bytes=${#prompt}
+            if (( prompt_bytes > 65536 )); then
+                warn "Prompt is ${prompt_bytes} bytes and this llama-cli build has no --file/-f option;" \
+                     "large prompts can fail with 'Argument list too long' as a raw CLI argument."
+            fi
+            LLAMA_CMD+=(--prompt "$prompt")
+        fi
 
-    debug "llama stdin execution"
+        if llama_supports '--single-turn'; then
+            LLAMA_CMD+=(--single-turn)
+        elif llama_supports '-st'; then
+            LLAMA_CMD+=(-st)
+        fi
 
-    # IMPORTANT:
-    #
-    # printf -> llama stdin
-    #
-    # EOF terminates the input stream. This prevents the interactive REPL
-    # from waiting for another user turn.
-    #
-    if have timeout; then
-        if output="$(
-            printf '%s\n' "$prompt" |
+        if llama_supports '--no-display-prompt'; then
+            LLAMA_CMD+=(--no-display-prompt)
+        fi
+
+        if [[ "${AI_VERBOSE:-false}" == "true" ]]; then
+            printf '%sMODEL:%s %s\n' "$C_DIM" "$C_RESET" "$model"
+            printf '%sCOMMAND:%s' "$C_DIM" "$C_RESET"
+            printf ' %q' "${LLAMA_CMD[@]}"
+            printf '\n'
+        fi
+
+        debug "executing llama (attempt $attempt)"
+
+        stderr_file="$(safe_tmp llama-stderr)"
+
+        if have timeout; then
+            if output="$(
                 timeout \
                     "$AI_TIMEOUT" \
-                    "${cmd[@]}" \
-                    < /dev/stdin \
+                    "${LLAMA_CMD[@]}" \
+                    < /dev/null \
                     2>"$stderr_file"
-        )"; then
-            rc=0
+            )"; then
+                rc=0
+            else
+                rc=$?
+            fi
         else
-            rc=$?
-        fi
-    else
-        if output="$(
-            printf '%s\n' "$prompt" |
-                "${cmd[@]}" \
-                < /dev/stdin \
+            if output="$(
+                "${LLAMA_CMD[@]}" \
+                < /dev/null \
                 2>"$stderr_file"
-        )"; then
-            rc=0
-        else
-            rc=$?
+            )"; then
+                rc=0
+            else
+                rc=$?
+            fi
         fi
-    fi
 
-    if (( rc != 0 )); then
-        LAST_ERROR="$(
-            cat "$stderr_file" 2>/dev/null || true
-        )"
+        if [[ $rc -ne 0 ]]; then
+            LAST_ERROR="$(cat "$stderr_file" 2>/dev/null || true)"
 
-        LAST_EXIT_CODE="$rc"
+            if [[ "$flipped_once" == "false" && "$LAST_ERROR" == *"unknown command"* ]]; then
+                if [[ "$LLAMA_SUBCOMMAND_CACHE" == "yes" ]]; then
+                    LLAMA_SUBCOMMAND_CACHE="no"
+                else
+                    LLAMA_SUBCOMMAND_CACHE="yes"
+                fi
+                flipped_once="true"
+
+                warn "llama cli/no-cli auto-detection looks wrong (${LAST_ERROR});" \
+                     "retrying once with the other invocation style"
+
+                continue
+            fi
+
+            break
+        fi
+
+        break
+    done
+
+    if [[ $rc -ne 0 ]]; then
+        LAST_EXIT_CODE=$rc
 
         {
             printf '[%s] exit=%s\n' "$(now_iso)" "$rc"
+            [[ -n "$LAST_ERROR" ]] && printf '%s\n' "$LAST_ERROR"
+            [[ -z "$LAST_ERROR" ]] && printf '(no stderr output â€” check AI_TIMEOUT=%s and that the model/args are valid)\n' "$AI_TIMEOUT"
+        } > "$LAST_ERROR_FILE" 2>/dev/null || true
 
-            if [[ -n "$LAST_ERROR" ]]; then
-                printf '%s\n' "$LAST_ERROR"
-            else
-                printf '%s\n' \
-                    "(llama produced no stderr; check timeout/model/runtime)"
-            fi
-        } > "$LAST_ERROR_FILE"
+        [[ -n "$LAST_ERROR" ]] &&
+            log_event "llama_error" \
+                "$LAST_ERROR" >/dev/null
 
         return "$rc"
     fi
@@ -806,7 +1109,7 @@ run_llama() {
 }
 
 # =============================================================================
-# LEDGER
+# LOGGING / LEDGER
 # =============================================================================
 
 log_event() {
@@ -841,27 +1144,25 @@ write_artifact() {
     local kind="$1"
     local content="$2"
     local parent="${3:-}"
-
     local hash
-    local text_file
-    local json_file
+    local file
+    local meta
 
     hash="$(sha256_string "$content")"
+    file="$OBJECT_DIR/$hash.txt"
+    meta="$OBJECT_DIR/$hash.json"
 
-    text_file="$OBJECT_DIR/$hash.txt"
-    json_file="$OBJECT_DIR/$hash.json"
-
-    if [[ ! -f "$text_file" ]]; then
-        printf '%s\n' "$content" > "$text_file"
+    if [[ ! -f "$file" ]]; then
+        printf '%s\n' "$content" > "$file"
     fi
 
-    cat > "$json_file" <<EOF
+    cat > "$meta" <<EOF
 {
   "hash":"$(json_escape "$hash")",
   "kind":"$(json_escape "$kind")",
   "parent":"$(json_escape "$parent")",
-  "created":"$(now_iso")",
-  "file":"$(json_escape "$text_file")"
+  "created":"$(now_iso)",
+  "file":"$(json_escape "$file")"
 }
 EOF
 
@@ -869,7 +1170,7 @@ EOF
 }
 
 # =============================================================================
-# NORMALIZATION
+# PROMPT NORMALIZATION
 # =============================================================================
 
 normalize_prompt() {
@@ -877,15 +1178,14 @@ normalize_prompt() {
 
     prompt="${prompt//$'\r'/}"
 
-    # Strip only leading/trailing blank lines.
     prompt="$(
         printf '%s\n' "$prompt" |
-            sed \
-                -e ':a' \
-                -e '/^[[:space:]]*$/{$d;N;ba' \
-                -e '}' \
-                -e 's/^[[:space:]]*//' \
-                -e 's/[[:space:]]*$//'
+        sed \
+            -e ':a' \
+            -e '/^[[:space:]]*$/{$d;N;ba' \
+            -e '}' \
+            -e 's/^[[:space:]]*//' \
+            -e 's/[[:space:]]*$//'
     )"
 
     printf '%s' "$prompt"
@@ -911,10 +1211,7 @@ PROMPT=$prompt
 EOF
     )
 
-    GENESIS_HASH="$(
-        sha256_string "$material"
-    )"
-
+    GENESIS_HASH="$(sha256_string "$material")"
     CURRENT_HASH="$GENESIS_HASH"
 
     log_event \
@@ -943,46 +1240,48 @@ create_task_hash() {
 }
 
 # =============================================================================
-# POV
+# 2PI / 8 POV
 # =============================================================================
 
 POV_NAMES=(
-    analytical
-    architectural
-    critical
-    creative
-    implementation
-    adversarial
-    systems
-    synthesis
+    "analytical"
+    "architectural"
+    "critical"
+    "creative"
+    "implementation"
+    "adversarial"
+    "systems"
+    "synthesis"
 )
 
 POV_ANGLES=(
-    0
-    45
-    90
-    135
-    180
-    225
-    270
-    315
+    "0"
+    "45"
+    "90"
+    "135"
+    "180"
+    "225"
+    "270"
+    "315"
 )
 
 build_pov_prompt() {
     local original="$1"
     local index="$2"
+    local name="${POV_NAMES[$index]}"
+    local angle="${POV_ANGLES[$index]}"
 
     cat <<EOF
-You are a reasoning node.
+You are one node in a deterministic 2PI/8-POV reasoning controller.
 
 TASK:
 $original
 
-POV:
-${POV_NAMES[$index]}
+VIEW:
+$name
 
-ANGLE:
-${POV_ANGLES[$index]} degrees
+ANGULAR POSITION:
+${angle} degrees
 
 GENESIS:
 $GENESIS_HASH
@@ -990,28 +1289,28 @@ $GENESIS_HASH
 TASK HASH:
 $TASK_HASH
 
-Produce an independent analysis from this viewpoint.
+You are NOT the final synthesizer.
+
+Produce an independent, technically useful analysis from this POV.
 
 Requirements:
-
-1. Stay focused on the task.
-2. Identify assumptions.
+1. Stay focused on the TASK.
+2. Identify assumptions explicitly.
 3. Separate facts from inference.
 4. Preserve concrete implementation details.
-5. Detect contradictions.
-6. Identify missing requirements.
-7. Prefer testable statements.
-8. Do not invent execution results.
-9. Do not discuss this orchestration protocol.
-10. Return only the useful analysis.
+5. Detect contradictions or missing requirements.
+6. Prefer testable statements.
+7. Do not discuss this orchestration protocol.
+8. Do not claim to have executed tools you did not execute.
+9. Return only the analysis for this POV.
 
-VIEW OBJECTIVE:
-${POV_NAMES[$index]}
+POV-SPECIFIC OBJECTIVE:
+$name
 EOF
 }
 
 # =============================================================================
-# SCORING
+# CANDIDATE SCORING
 # =============================================================================
 
 count_words() {
@@ -1019,17 +1318,15 @@ count_words() {
         awk '{n+=NF} END {print n+0}'
 }
 
-structure_score() {
+count_structure() {
     local text="$1"
     local score=0
 
-    grep -Eq \
-        '(^|[[:space:]])(1\.|2\.|3\.|4\.|5\.|- |\* )' \
+    grep -Eq '(^|[[:space:]])(1\.|2\.|3\.|4\.|5\.|- |\* )' \
         <<< "$text" &&
         score=$((score + 1))
 
-    grep -Eiq \
-        '(because|therefore|however|implementation|solution|problem|constraint)' \
+    grep -Eq '(^|[[:space:]])(because|therefore|however|implementation|solution|problem|constraint)' \
         <<< "$text" &&
         score=$((score + 1))
 
@@ -1039,7 +1336,7 @@ structure_score() {
     printf '%s\n' "$score"
 }
 
-directness_score() {
+count_directness() {
     local text="$1"
     local score=0
 
@@ -1061,15 +1358,14 @@ score_candidate() {
     local words
     local structure
     local directness
-    local length_score
-    local structure_score
-    local direct_score
-    local hash_score
     local completeness
+    local length_score
+    local hash_score
+    local total
 
     words="$(count_words "$text")"
-    structure="$(structure_score "$text")"
-    directness="$(directness_score "$text")"
+    structure="$(count_structure "$text")"
+    directness="$(count_directness "$text")"
 
     if (( words >= 100 )); then
         length_score=100
@@ -1083,83 +1379,84 @@ score_candidate() {
         length_score=0
     fi
 
-    structure_score=$((structure * 3333 / 100))
-    direct_score=$((directness * 5000 / 100))
-    hash_score=$((16#${hash:0:2} * 100 / 255))
+    hash_score=$((16#${hash:0:2}))
 
-    if (( structure >= 2 )); then
-        completeness=100
-    else
-        completeness=$((structure * 50))
-    fi
+    completeness="$(
+        awk \
+            -v x="$structure" \
+            'BEGIN {
+                if (x >= 2) {
+                    printf "%d", 100
+                } else {
+                    printf "%d", x * 50
+                }
+            }'
+    )"
 
-    awk \
-        -v l="$length_score" \
-        -v s="$structure_score" \
-        -v d="$direct_score" \
-        -v h="$hash_score" \
-        -v c="$completeness" \
-        'BEGIN {
-            total =
-                l * 0.20 +
-                s * 0.20 +
-                d * 0.20 +
-                h * 0.10 +
-                c * 0.30
+    total="$(
+        awk \
+            -v l="$length_score" \
+            -v s="$structure" \
+            -v d="$directness" \
+            -v h="$hash_score" \
+            -v c="$completeness" \
+            'BEGIN {
+                structure_score = s * 33.3333
+                direct_score = d * 50
+                hash_score = h / 255 * 100
+                total = l * 0.20 + structure_score * 0.20 + direct_score * 0.20 + hash_score * 0.10 + c * 0.30
+                printf "%.3f", total
+            }'
+    )"
 
-            printf "%.3f\n", total
-        }'
+    printf '%s\n' "$total"
 }
 
 # =============================================================================
-# RUN ONE POV
+# SINGLE POV
 # =============================================================================
 
 run_pov() {
     local original="$1"
     local index="$2"
 
-    local prompt
+    local pov_prompt
     local output
     local hash
     local score
     local artifact
 
-    prompt="$(
+    POV_INDEX="$index"
+    POV_NAME="${POV_NAMES[$index]}"
+    POV_ANGLE="${POV_ANGLES[$index]}"
+
+    pov_prompt="$(
         build_pov_prompt \
             "$original" \
             "$index"
     )"
 
-    info \
-        "POV $((index + 1))/8 — ${POV_NAMES[$index]} @ ${POV_ANGLES[$index]}°"
+    info "POV $((index + 1))/8 â€” $POV_NAME @ ${POV_ANGLE}Â°"
 
-    if ! output="$(
-        run_llama "$prompt"
-    )"; then
-
-        warn "POV failed: ${POV_NAMES[$index]}"
+    output="$(
+        run_llama "$pov_prompt"
+    )" || {
+        warn "POV failed: $POV_NAME"
         show_last_error
         return 1
-    fi
+    }
 
-    if (( ${#output} < AI_MIN_OUTPUT )); then
-        warn \
-            "POV produced insufficient output: ${POV_NAMES[$index]}"
+    if [[ ${#output} -lt "$AI_MIN_OUTPUT" ]]; then
+        warn "POV produced insufficient output: $POV_NAME"
         return 1
     fi
 
     hash="$(sha256_string "$output")"
-
-    score="$(
-        score_candidate \
-            "$output" \
-            "$hash"
-    )"
+    score="$(score_candidate "$output" "$hash")"
 
     artifact="$(
         write_artifact \
-            "pov:${POV_NAMES[$index]}" \
+            "pov:$POV_NAME" \
             "$output" \
             "$TASK_HASH"
     )"
@@ -1170,10 +1467,10 @@ run_pov() {
 
     log_event \
         "pov" \
-        "task=$TASK_HASH pov=${POV_NAMES[$index]} angle=${POV_ANGLES[$index]} hash=$hash score=$score" \
+        "task=$TASK_HASH pov=$POV_NAME angle=$POV_ANGLE hash=$hash score=$score" \
         >/dev/null
 
-    return 0
+    printf '%s\n' "$output"
 }
 
 # =============================================================================
@@ -1183,9 +1480,10 @@ run_pov() {
 best_candidate_index() {
     local i
     local best=-1
-    local best_score=-1
+    local best_score="-1"
 
     for i in "${!CANDIDATE_SCORES[@]}"; do
+
         if awk \
             -v a="${CANDIDATE_SCORES[$i]}" \
             -v b="$best_score" \
@@ -1194,6 +1492,7 @@ best_candidate_index() {
             best="$i"
             best_score="${CANDIDATE_SCORES[$i]}"
         fi
+
     done
 
     printf '%s\n' "$best"
@@ -1218,15 +1517,14 @@ synthesize_candidates() {
     local index
     local best
     local source
-    local prompt
+    local synthesis_prompt
     local output
     local hash
 
     if [[ "${AI_SYNTHESIS,,}" != "true" ]]; then
-
         best="$(best_candidate_index)"
 
-        if (( best >= 0 )); then
+        if [[ "$best" -ge 0 ]]; then
             get_candidate_text \
                 "${CANDIDATE_FILES[$best]}"
         fi
@@ -1234,9 +1532,9 @@ synthesize_candidates() {
         return 0
     fi
 
-    prompt=$(
+    synthesis_prompt=$(
         cat <<EOF
-You are the final synthesis node.
+You are the synthesis node of a deterministic 2PI/8-POV reasoning process.
 
 ORIGINAL TASK:
 $original
@@ -1251,7 +1549,6 @@ CANDIDATES:
 EOF
 
         for index in "${!CANDIDATE_FILES[@]}"; do
-
             source="$(
                 get_candidate_text \
                     "${CANDIDATE_FILES[$index]}"
@@ -1271,39 +1568,37 @@ EOF
 
         cat <<'EOF'
 
-SYNTHESIS:
+SYNTHESIS REQUIREMENTS:
 
-1. Reconcile useful information.
-2. Resolve contradictions.
+1. Reconcile useful information across candidates.
+2. Resolve contradictions explicitly.
 3. Do not average incorrect claims.
-4. Prefer concrete implementation.
-5. Preserve constraints.
-6. Remove redundancy.
-7. Produce one coherent answer.
-8. Do not mention the candidate machinery.
+4. Prefer concrete and testable implementation.
+5. Preserve important constraints.
+6. Remove redundant material.
+7. Produce one coherent final answer.
+8. Do not mention the POV machinery.
 9. Do not claim execution that did not occur.
-10. Return only the final answer.
+10. Return only the synthesized answer.
 EOF
     )
 
     info "SYNTHESIS"
 
-    if ! output="$(
-        run_llama "$prompt"
-    )"; then
-
-        warn "synthesis failed; selecting best candidate"
+    output="$(
+        run_llama "$synthesis_prompt"
+    )" || {
+        warn "Synthesis failed; using best candidate."
         show_last_error
-
         best="$(best_candidate_index)"
 
-        if (( best >= 0 )); then
+        if [[ "$best" -ge 0 ]]; then
             get_candidate_text \
                 "${CANDIDATE_FILES[$best]}"
         fi
 
         return 0
-    fi
+    }
 
     hash="$(sha256_string "$output")"
 
@@ -1321,7 +1616,7 @@ EOF
 }
 
 # =============================================================================
-# ROUND
+# ONE ORCHESTRATION ROUND
 # =============================================================================
 
 run_round() {
@@ -1329,7 +1624,7 @@ run_round() {
     local depth="$2"
 
     local i
-    local output
+    local output=""
 
     CANDIDATE_FILES=()
     CANDIDATE_SCORES=()
@@ -1338,21 +1633,27 @@ run_round() {
     info "ROUND $depth/$AI_DEPTH"
 
     for ((i = 0; i < AI_VIEWS; i++)); do
-        run_pov "$original" "$i" >/dev/null || true
+        if ! run_pov "$original" "$i" >/dev/null; then
+            continue
+        fi
     done
 
-    (( ${#CANDIDATE_FILES[@]} > 0 )) ||
-        return 1
+    if (( ${#CANDIDATE_FILES[@]} == 0 )); then
+        die "All POV executions failed."
+    fi
 
     output="$(
-        synthesize_candidates "$original"
+        synthesize_candidates \
+            "$original"
     )"
 
     printf '%s\n' "$output"
+
+    return 0
 }
 
 # =============================================================================
-# ENGINE
+# RECURSIVE ENGINE
 # =============================================================================
 
 run_engine() {
@@ -1360,13 +1661,10 @@ run_engine() {
 
     local normalized
     local depth
-    local result=""
+    local result
     local parent_hash
-    local result_hash
 
-    normalized="$(
-        normalize_prompt "$prompt"
-    )"
+    normalized="$(normalize_prompt "$prompt")"
 
     [[ -n "$normalized" ]] ||
         die "empty prompt"
@@ -1386,18 +1684,14 @@ run_engine() {
 
     for ((depth = 1; depth <= AI_DEPTH; depth++)); do
 
-        if ! result="$(
+        result="$(
             run_round \
                 "$normalized" \
                 "$depth"
-        )"; then
-
-            die "round $depth failed: no usable candidate"
-        fi
-
-        result_hash="$(
-            sha256_string "$result"
         )"
+
+        local result_hash
+        result_hash="$(sha256_string "$result")"
 
         log_event \
             "round" \
@@ -1412,10 +1706,9 @@ run_engine() {
         parent_hash="$result_hash"
 
         if (( depth < AI_DEPTH )); then
-
             normalized=$(
                 cat <<EOF
-Continue solving the following task.
+Continue solving the following task using the previous result as state.
 
 ORIGINAL TASK:
 $prompt
@@ -1423,13 +1716,12 @@ $prompt
 PREVIOUS RESULT:
 $result
 
-CONTINUATION:
-
+Continuation requirements:
 - identify unresolved issues
 - correct contradictions
 - improve implementation precision
-- retain useful information
-- produce an improved result
+- retain useful prior information
+- produce a better candidate
 EOF
             )
 
@@ -1437,6 +1729,7 @@ EOF
         fi
     done
 
+    # Final answer.
     printf '%s\n' "$result"
 }
 
@@ -1465,15 +1758,14 @@ append_session() {
 }
 
 run_chat() {
-    local prompt
-    local response
+    local prompt=""
 
     info "interactive session: $AI_SESSION"
-    info "type /help or /exit"
+    info "type /help for commands"
+    info "type /exit to leave"
 
     while true; do
-
-        printf '> '
+        printf '%s\n' '> '
 
         if ! IFS= read -r prompt; then
             printf '\n'
@@ -1481,18 +1773,16 @@ run_chat() {
         fi
 
         case "$prompt" in
-
             /exit|/quit)
                 break
                 ;;
 
             /help)
                 printf '%s\n' \
-                    '/help    show commands' \
-                    '/exit    leave session' \
-                    '/clear   clear session' \
-                    '/status  runtime status' \
-                    '/models  model registry'
+                    '/exit  leave session' \
+                    '/clear clear session log' \
+                    '/status runtime status' \
+                    '/models model status'
                 ;;
 
             /clear)
@@ -1515,6 +1805,7 @@ run_chat() {
             *)
                 append_session user "$prompt"
 
+                local response
                 response="$(
                     run_engine "$prompt"
                 )"
@@ -1528,413 +1819,37 @@ run_chat() {
 }
 
 # =============================================================================
-# FILE SANDBOX
+# MODEL INSTALLATION
 # =============================================================================
 
-init_file_index() {
-    [[ -f "$FILE_INDEX" ]] ||
-        printf '{"entries":[]}\n' > "$FILE_INDEX"
+check_disk_space() {
+    local target_dir="$1"
+
+    have df || return 0
+
+    df -Pk "$target_dir" |
+        awk 'NR==2 {print $4}'
 }
 
-resolve_file_path() {
-    local input="$1"
-    local path
-
-    if [[ "$input" = /* ]]; then
-        path="$input"
-    else
-        path="$FILE_ROOT/$input"
-    fi
-
-    have realpath ||
-        die "realpath is required for sandboxed file operations"
-
-    path="$(realpath -m -- "$path")"
-
-    if [[ "${AI_ALLOW_UNSAFE_PATHS:-false}" != "true" ]]; then
-
-        case "$path" in
-            "$FILE_ROOT"|"$FILE_ROOT"/*)
-                ;;
-            *)
-                die \
-                    "sandbox violation: $path"
-                ;;
-        esac
-    fi
-
-    printf '%s\n' "$path"
-}
-
-file_index_record() {
-    local action="$1"
-    local path="$2"
-    local hash="${3:-}"
-    local size="${4:-0}"
-
-    init_file_index
-
-    have jq ||
-        die "jq is required for file index operations"
-
-    jq \
-        --arg timestamp "$(now_iso)" \
-        --arg action "$action" \
-        --arg path "$path" \
-        --arg hash "$hash" \
-        --argjson size "$size" \
-        '.entries += [{
-            "timestamp":$timestamp,
-            "action":$action,
-            "path":$path,
-            "hash":$hash,
-            "size":$size
-        }]' \
-        "$FILE_INDEX" \
-        > "$FILE_INDEX.tmp"
-
-    mv \
-        "$FILE_INDEX.tmp" \
-        "$FILE_INDEX"
-
-    log_event \
-        "file_$action" \
-        "path=$path hash=$hash size=$size" \
-        >/dev/null
-}
-
-file_create() {
-    local rel="$1"
-    local content="$2"
-    local path
-
-    path="$(resolve_file_path "$rel")"
-
-    [[ ! -e "$path" ]] ||
-        die "already exists: $path"
-
-    mkdir -p "$(dirname "$path")"
-
-    printf '%s' "$content" > "$path"
-
-    file_index_record \
-        create \
-        "$path" \
-        "$(sha256_file "$path")" \
-        "$(wc -c < "$path")"
-
-    ok "created: $path"
-}
-
-file_read() {
-    local path
-
-    path="$(resolve_file_path "$1")"
-
-    [[ -f "$path" ]] ||
-        die "not found: $path"
-
-    cat "$path"
-}
-
-file_write() {
-    local rel="$1"
-    local content="$2"
-    local path
-
-    path="$(resolve_file_path "$rel")"
-
-    mkdir -p "$(dirname "$path")"
-
-    printf '%s' "$content" > "$path"
-
-    file_index_record \
-        write \
-        "$path" \
-        "$(sha256_file "$path")" \
-        "$(wc -c < "$path")"
-
-    ok "wrote: $path"
-}
-
-file_append() {
-    local rel="$1"
-    local content="$2"
-    local path
-
-    path="$(resolve_file_path "$rel")"
-
-    mkdir -p "$(dirname "$path")"
-
-    printf '%s' "$content" >> "$path"
-
-    file_index_record \
-        append \
-        "$path" \
-        "$(sha256_file "$path")" \
-        "$(wc -c < "$path")"
-
-    ok "appended: $path"
-}
-
-file_delete() {
-    local path
-
-    path="$(resolve_file_path "$1")"
-
-    [[ -e "$path" ]] ||
-        die "not found: $path"
-
-    rm -rf -- "$path"
-
-    file_index_record \
-        delete \
-        "$path" \
-        "" \
-        0
-
-    ok "deleted: $path"
-}
-
-file_list() {
-    local path
-
-    path="$(resolve_file_path "${1:-.}")"
-
-    [[ -d "$path" ]] ||
-        die "not a directory: $path"
-
-    find "$path" \
-        -mindepth 1 \
-        -maxdepth 4 \
-        -printf '%y %10s  %p\n' \
-        2>/dev/null |
-        sort -k3
-}
-
-cmd_file() {
-    local sub="${1:-}"
-    shift || true
-
-    local rel
-    local content
-
-    case "$sub" in
-
-        create)
-            rel="${1:-}"
-            shift || true
-
-            [[ -n "$rel" ]] ||
-                die "usage: ai file create PATH [CONTENT|-]"
-
-            content="${1:-}"
-
-            if [[ "$content" == "-" ||
-                  ( -z "$content" && ! -t 0 ) ]]; then
-                content="$(cat)"
-            fi
-
-            file_create "$rel" "$content"
-            ;;
-
-        read|cat)
-            rel="${1:-}"
-
-            [[ -n "$rel" ]] ||
-                die "usage: ai file read PATH"
-
-            file_read "$rel"
-            ;;
-
-        write)
-            rel="${1:-}"
-            shift || true
-
-            [[ -n "$rel" ]] ||
-                die "usage: ai file write PATH [CONTENT|-]"
-
-            content="${1:-}"
-
-            if [[ "$content" == "-" ||
-                  ( -z "$content" && ! -t 0 ) ]]; then
-                content="$(cat)"
-            fi
-
-            file_write "$rel" "$content"
-            ;;
-
-        append)
-            rel="${1:-}"
-            shift || true
-
-            [[ -n "$rel" ]] ||
-                die "usage: ai file append PATH [CONTENT|-]"
-
-            content="${1:-}"
-
-            if [[ "$content" == "-" ||
-                  ( -z "$content" && ! -t 0 ) ]]; then
-                content="$(cat)"
-            fi
-
-            file_append "$rel" "$content"
-            ;;
-
-        delete|rm)
-            rel="${1:-}"
-
-            [[ -n "$rel" ]] ||
-                die "usage: ai file delete PATH"
-
-            file_delete "$rel"
-            ;;
-
-        list|ls)
-            file_list "${1:-.}"
-            ;;
-
-        root)
-            printf '%s\n' "$FILE_ROOT"
-            ;;
-
-        *)
-            die \
-                "usage: ai file {create|read|write|append|delete|list|root}"
-            ;;
-    esac
-}
-
-# =============================================================================
-# SCAN
-# =============================================================================
-
-cmd_scan() {
-    local dir="${1:-.}"
-    shift || true
-
-    local instruction="$*"
-
-    [[ -n "$instruction" ]] ||
-        die 'usage: ai scan DIR "instruction"'
-
-    [[ -d "$dir" ]] ||
-        die "not a directory: $dir"
-
-    local extensions="${AI_SCAN_EXTENSIONS:-html,htm,js,mjs,ts,css,json,sh,md}"
-    local depth="${AI_SCAN_DEPTH:-3}"
-
-    local -a find_expr=()
-    local -a exts=()
-
-    local ext
-    local f
-    local size
-    local content
-
-    local combined=""
-    local included=0
-    local skipped=0
-
-    IFS=',' read -ra exts <<< "$extensions"
-
-    for ext in "${exts[@]}"; do
-
-        [[ ${#find_expr[@]} -gt 0 ]] &&
-            find_expr+=(-o)
-
-        find_expr+=(
-            -iname
-            "*.${ext}"
-        )
-    done
-
-    # Approximate byte budget.
-    #
-    # 4 bytes/token is deliberately conservative for source code.
-    local max_total_bytes=$((AI_CONTEXT * 3))
-    local max_file_bytes="${AI_SCAN_FILE_BYTES:-4000}"
-
-    while IFS= read -r -d '' f; do
-
-        size="$(wc -c < "$f" 2>/dev/null || echo 0)"
-
-        if (( ${#combined} + size > max_total_bytes )); then
-            skipped=$((skipped + 1))
-            continue
-        fi
-
-        content="$(
-            head \
-                -c "$max_file_bytes" \
-                -- "$f" \
-                2>/dev/null ||
-                true
-        )"
-
-        combined+=$'\n\n--- FILE: '"$f"$' ---\n'"$content"
-
-        included=$((included + 1))
-
-    done < <(
-        find "$dir" \
-            -maxdepth "$depth" \
-            -type f \
-            \( "${find_expr[@]}" \) \
-            -print0 \
-            2>/dev/null |
-            sort -z
-    )
-
-    [[ -n "$combined" ]] ||
-        die \
-            "no matching files under $dir"
-
-    info \
-        "scan: $included file(s), skipped $skipped, root=$dir"
-
-    local prompt
-
-    prompt=$(
-        cat <<EOF
-TASK:
-$instruction
-
-SOURCE DIRECTORY:
-$dir
-
-The following source files were actually read.
-
-Base your analysis only on the contents supplied below.
-
-$combined
-EOF
-    )
-
-    run_engine "$prompt"
-}
-
-# =============================================================================
-# INSTALL
-# =============================================================================
-
-download_model() {
+download_with_curl() {
     local url="$1"
     local target="$2"
-    local tmp
+    local temp
 
     have curl ||
         die "curl is required for model installation"
 
-    tmp="$(
-        mktemp "$MODEL_DIR/.download.XXXXXX"
+    temp="$(
+        mktemp \
+            "$MODEL_DIR/.download.XXXXXX"
     )"
 
-    TMP_FILES+=("$tmp")
+    TMP_FILES+=("$temp")
 
-    info "downloading model"
+    info "Downloading model"
     printf 'URL    : %s\n' "$url"
     printf 'TARGET : %s\n' "$target"
+    printf '\n'
 
     if ! curl \
         --fail \
@@ -1943,38 +1858,38 @@ download_model() {
         --retry-delay 3 \
         --connect-timeout 20 \
         --continue-at - \
-        --output "$tmp" \
+        --output "$temp" \
         "$url"
     then
-
-        rm -f "$tmp"
-
-        die "download failed"
+        rm -f "$temp"
+        die "model download failed"
     fi
 
-    verify_gguf "$tmp" ||
-        die "downloaded object is not valid GGUF"
+    verify_gguf "$temp" ||
+        die "downloaded file is not a valid GGUF"
 
     mv -f \
-        "$tmp" \
+        "$temp" \
         "$target"
 
-    ok "installed: $target"
+    ok "model installed: $target"
 }
 
 install_primary() {
     local url
 
+    mkdir -p "$MODEL_DIR"
+
     if [[ -f "$PRIMARY_LOCAL_PATH" ]] &&
        verify_gguf "$PRIMARY_LOCAL_PATH"; then
 
-        ok "primary already installed"
-        return
+        ok "primary model already installed"
+        return 0
     fi
 
     url="https://huggingface.co/${PRIMARY_HF_REPO}/resolve/main/${AI_PRIMARY_FILE}"
 
-    download_model \
+    download_with_curl \
         "$url" \
         "$PRIMARY_LOCAL_PATH"
 }
@@ -1982,22 +1897,26 @@ install_primary() {
 install_fallback() {
     local url
 
+    mkdir -p "$MODEL_DIR"
+
     if [[ -f "$FALLBACK_LOCAL_PATH" ]] &&
        verify_gguf "$FALLBACK_LOCAL_PATH"; then
 
-        ok "fallback already installed"
-        return
+        ok "fallback model already installed"
+        return 0
     fi
 
     url="https://huggingface.co/${FALLBACK_HF_REPO}/resolve/main/${AI_FALLBACK_FILE}"
 
-    download_model \
+    download_with_curl \
         "$url" \
         "$FALLBACK_LOCAL_PATH"
 }
 
 cmd_install() {
-    case "${1:-primary}" in
+    local target="${1:-primary}"
+
+    case "$target" in
 
         primary|coder)
             install_primary
@@ -2013,19 +1932,18 @@ cmd_install() {
             ;;
 
         *)
-            die \
-                "usage: ai install {primary|fallback|all}"
+            die "usage: ai install primary|fallback|all"
             ;;
     esac
 }
 
 # =============================================================================
-# MODELS
+# MODEL COMMAND
 # =============================================================================
 
 cmd_models() {
-    local primary
-    local fallback
+    local primary=""
+    local fallback=""
 
     primary="$(find_primary_model || true)"
     fallback="$(find_fallback_model || true)"
@@ -2046,25 +1964,36 @@ cmd_models() {
         printf '  status: MISSING\n'
     fi
 
-    printf '\nPRIMARY\n'
-    printf '  logical : %s\n' "$AI_MODEL"
-    printf '  local   : %s\n' "$PRIMARY_LOCAL_PATH"
+    printf '\n'
+    printf 'Model directory:\n'
+    printf '  %s\n' "$MODEL_DIR"
+
+    printf '\n'
+    printf 'Logical primary:\n'
+    printf '  %s\n' "$AI_MODEL"
+
+    printf 'Logical fallback:\n'
+    printf '  %s\n' "$AI_FALLBACK"
+
+    printf '\n'
+    printf 'PRIMARY\n'
+    printf '  local: %s\n' "$PRIMARY_LOCAL_PATH"
 
     if [[ -n "$primary" ]]; then
         printf '  resolved: %s\n' "$primary"
-        printf '  size    : %s\n' \
+        printf '  size: %s\n' \
             "$(du -h "$primary" | awk '{print $1}')"
     else
         printf '  resolved: NOT FOUND\n'
     fi
 
-    printf '\nFALLBACK\n'
-    printf '  logical : %s\n' "$AI_FALLBACK"
-    printf '  local   : %s\n' "$FALLBACK_LOCAL_PATH"
+    printf '\n'
+    printf 'FALLBACK\n'
+    printf '  local: %s\n' "$FALLBACK_LOCAL_PATH"
 
     if [[ -n "$fallback" ]]; then
         printf '  resolved: %s\n' "$fallback"
-        printf '  size    : %s\n' \
+        printf '  size: %s\n' \
             "$(du -h "$fallback" | awk '{print $1}')"
     else
         printf '  resolved: NOT FOUND\n'
@@ -2073,11 +2002,14 @@ cmd_models() {
     printf '\n'
 
     if [[ -n "$primary" ]]; then
-        ok "PRIMARY READY"
+        ok "PRIMARY MODEL READY"
     elif [[ -n "$fallback" ]]; then
-        warn "PRIMARY MISSING — FALLBACK READY"
+        warn "PRIMARY MISSING â€” FALLBACK READY"
     else
         warn "NO GGUF MODEL FOUND"
+        printf '\n'
+        printf 'Install primary with:\n'
+        printf '  ai install primary\n'
     fi
 
     printf '\n'
@@ -2088,7 +2020,7 @@ cmd_models() {
 # =============================================================================
 
 cmd_status() {
-    local model
+    local model=""
 
     model="$(resolve_model || true)"
 
@@ -2103,29 +2035,20 @@ cmd_status() {
     printf 'Runtime       : %s\n' "$LLAMA_CLI"
     printf 'Model         : %s\n' "${model:-NONE}"
     printf 'Tier          : %s\n' "${CURRENT_MODEL_TIER:-NONE}"
-
-    printf '\nInference\n'
     printf 'Context       : %s\n' "$AI_CONTEXT"
     printf 'Batch         : %s\n' "$AI_BATCH"
     printf 'UBatch        : %s\n' "$AI_UBATCH"
     printf 'Predict       : %s\n' "$AI_PREDICT"
     printf 'Threads       : %s\n' "$AI_THREADS"
-    printf 'GPU layers    : %s\n' "$AI_GPU_LAYERS"
     printf 'Temperature   : %s\n' "$AI_TEMPERATURE"
     printf 'Top-K         : %s\n' "$AI_TOP_K"
     printf 'Top-P         : %s\n' "$AI_TOP_P"
     printf 'Repeat        : %s\n' "$AI_REPEAT_PENALTY"
-    printf 'Timeout       : %s\n' "$AI_TIMEOUT"
-
-    printf '\nOrchestration\n'
     printf 'POV views     : %s\n' "$AI_VIEWS"
     printf 'Depth         : %s\n' "$AI_DEPTH"
     printf 'Synthesis     : %s\n' "$AI_SYNTHESIS"
-
-    printf '\nState\n'
+    printf 'Session       : %s\n' "$AI_SESSION"
     printf 'State         : %s\n' "$STATE_DIR"
-    printf 'Objects       : %s\n' "$OBJECT_DIR"
-    printf 'Files         : %s\n' "$FILE_ROOT"
 
     printf '\n'
 }
@@ -2135,8 +2058,8 @@ cmd_status() {
 # =============================================================================
 
 cmd_doctor() {
-    local model
-    local version
+    local model=""
+    local version=""
 
     printf '\n'
     printf '%sAI RUNTIME DOCTOR%s\n' \
@@ -2158,18 +2081,21 @@ cmd_doctor() {
     fi
 
     if [[ -x "$LLAMA_CLI" ]]; then
+        if llama_uses_cli_subcommand; then
+            printf '  invocation: %s cli --model ... (subcommand-style CLI)\n' "$LLAMA_CLI"
+        else
+            printf '  invocation: %s --model ... (flag-style CLI)\n' "$LLAMA_CLI"
+        fi
+    fi
 
+    if [[ -x "$LLAMA_CLI" ]]; then
         version="$(
-            "$LLAMA_CLI" \
-                --version \
-                2>&1 |
-                head -n 1 ||
-                true
+            "$LLAMA_CLI" --version 2>&1 |
+            head -n 1 ||
+            true
         )"
 
         printf '  version: %s\n' "$version"
-
-        printf '  contract: llama cli -m MODEL\n'
     fi
 
     printf '\nTools:\n'
@@ -2182,14 +2108,9 @@ cmd_doctor() {
         sort \
         head \
         tail \
-        od \
         sha256sum \
-        realpath \
-        jq \
-        curl \
-        timeout
+        curl
     do
-
         if have "$tool"; then
             printf '  %-12s OK\n' "$tool"
         else
@@ -2197,19 +2118,19 @@ cmd_doctor() {
         fi
     done
 
-    printf '\nModel:\n'
+    printf '\nModels:\n'
 
     model="$(resolve_model || true)"
 
-    if [[ -n "$model" ]]; then
+    if [[ -n "$model" && -f "$model" ]]; then
         ok "GGUF resolved"
-
         printf '  tier: %s\n' "$CURRENT_MODEL_TIER"
         printf '  file: %s\n' "$model"
         printf '  size: %s\n' \
             "$(du -h "$model" | awk '{print $1}')"
     else
-        warn "no GGUF model resolved"
+        warn "No GGUF model resolved"
+        printf '  install: ai install primary\n'
     fi
 
     printf '\nConfiguration:\n'
@@ -2218,35 +2139,20 @@ cmd_doctor() {
     printf '  ubatch      = %s\n' "$AI_UBATCH"
     printf '  predict     = %s\n' "$AI_PREDICT"
     printf '  threads     = %s\n' "$AI_THREADS"
+    printf '  temperature = %s\n' "$AI_TEMPERATURE"
+    printf '  top-k       = %s\n' "$AI_TOP_K"
+    printf '  top-p       = %s\n' "$AI_TOP_P"
+    printf '  repeat      = %s\n' "$AI_REPEAT_PENALTY"
+
+    printf '\nOrchestration:\n'
     printf '  views       = %s\n' "$AI_VIEWS"
     printf '  depth       = %s\n' "$AI_DEPTH"
     printf '  synthesis   = %s\n' "$AI_SYNTHESIS"
 
+    printf '\nState:\n'
+    printf '  %s\n' "$STATE_DIR"
+
     printf '\n'
-}
-
-# =============================================================================
-# TEST
-# =============================================================================
-
-cmd_test() {
-    local model
-
-    model="$(resolve_model || true)"
-
-    [[ -n "$model" ]] ||
-        die "no GGUF model available"
-
-    verify_gguf "$model" ||
-        die "invalid model: $model"
-
-    info "LLAMA TEST"
-    printf 'Model : %s\n' "$model"
-    printf 'Size  : %s\n\n' \
-        "$(du -h "$model" | awk '{print $1}')"
-
-    run_llama \
-        "Reply with exactly: OK"
 }
 
 # =============================================================================
@@ -2265,13 +2171,14 @@ MODEL
   AI_MODEL=$AI_MODEL
   AI_CODER=$AI_CODER
   AI_FALLBACK=$AI_FALLBACK
-
-PHYSICAL
+  AI_MODEL_DIR=$MODEL_DIR
   AI_MODEL_PATH=$AI_MODEL_PATH
   AI_FALLBACK_PATH=$AI_FALLBACK_PATH
-  AI_MODEL_DIR=$MODEL_DIR
-  AI_PRIMARY_FILE=$AI_PRIMARY_FILE
-  AI_FALLBACK_FILE=$AI_FALLBACK_FILE
+
+PHYSICAL
+  PRIMARY_LOCAL_PATH=$PRIMARY_LOCAL_PATH
+  FALLBACK_LOCAL_PATH=$FALLBACK_LOCAL_PATH
+  AI_HF_ROOT=$AI_HF_ROOT
 
 INFERENCE
   AI_CONTEXT=$AI_CONTEXT
@@ -2291,15 +2198,6 @@ ORCHESTRATION
   AI_DEPTH=$AI_DEPTH
   AI_SYNTHESIS=$AI_SYNTHESIS
   AI_SESSION=$AI_SESSION
-
-SCAN
-  AI_SCAN_EXTENSIONS=${AI_SCAN_EXTENSIONS:-html,htm,js,mjs,ts,css,json,sh,md}
-  AI_SCAN_DEPTH=${AI_SCAN_DEPTH:-3}
-  AI_SCAN_FILE_BYTES=${AI_SCAN_FILE_BYTES:-4000}
-
-FILES
-  FILE_ROOT=$FILE_ROOT
-  AI_ALLOW_UNSAFE_PATHS=${AI_ALLOW_UNSAFE_PATHS:-false}
 
 STATE
   STATE_DIR=$STATE_DIR
@@ -2321,13 +2219,205 @@ cmd_hash() {
     local input="$*"
 
     [[ -n "$input" ]] ||
-        die 'usage: ai hash TEXT'
+        die "usage: ai hash TEXT"
 
     sha256_string "$input"
 }
 
 # =============================================================================
-# DB
+# FILE CRUD (sandboxed)
+# =============================================================================
+
+FILE_ROOT="${AI_FILE_ROOT:-$AI_HOME/files}"
+mkdir -p "$FILE_ROOT"
+
+FILE_INDEX="$DB_DIR/file_index.json"
+
+init_file_index() {
+    if [[ ! -f "$FILE_INDEX" ]]; then
+        printf '{"entries":[]}\n' > "$FILE_INDEX"
+    fi
+}
+
+resolve_file_path() {
+    local input="$1"
+    local abs=""
+
+    if [[ "$input" = /* ]]; then
+        abs="$input"
+    else
+        abs="$FILE_ROOT/$input"
+    fi
+
+    if have realpath; then
+        abs="$(realpath -m -- "$abs")"
+    else
+        mkdir -p "$(dirname "$abs")" 2>/dev/null || true
+        abs="$(
+            cd "$(dirname "$abs")" 2>/dev/null && \
+            printf '%s/%s\n' "$(pwd -P)" "$(basename "$abs")"
+        )" || die "cannot resolve path: $input"
+    fi
+
+    if [[ "${AI_ALLOW_UNSAFE_PATHS:-false}" != "true" ]]; then
+        case "$abs" in
+            "$FILE_ROOT"/*|"$FILE_ROOT")
+                : ;;
+            *)
+                die "path escapes sandbox ($FILE_ROOT): $abs â€” set AI_ALLOW_UNSAFE_PATHS=true to override"
+                ;;
+        esac
+    fi
+
+    printf '%s\n' "$abs"
+}
+
+file_index_record() {
+    local action="$1"
+    local path="$2"
+    local hash="${3:-}"
+    local size="${4:-0}"
+
+    init_file_index
+
+    jq --arg ts "$(now_iso)" \
+       --arg action "$action" \
+       --arg path "$path" \
+       --arg hash "$hash" \
+       --argjson size "$size" \
+       '.entries += [{"timestamp": $ts, "action": $action, "path": $path, "hash": $hash, "size": $size}]' \
+       "$FILE_INDEX" > "${FILE_INDEX}.tmp" && mv "${FILE_INDEX}.tmp" "$FILE_INDEX"
+
+    log_event "file_$action" "$path" >/dev/null
+}
+
+file_create() {
+    local rel="$1"
+    local content="$2"
+    local path
+
+    path="$(resolve_file_path "$rel")"
+    mkdir -p "$(dirname "$path")"
+
+    [[ -e "$path" ]] && die "already exists (use 'ai file write' to overwrite): $path"
+
+    printf '%s' "$content" > "$path"
+
+    file_index_record "create" "$path" "$(sha256_file "$path" || true)" "$(wc -c < "$path")"
+    ok "created: $path"
+}
+
+file_read() {
+    local rel="$1"
+    local path
+
+    path="$(resolve_file_path "$rel")"
+    [[ -f "$path" ]] || die "not found: $path"
+
+    cat "$path"
+}
+
+file_write() {
+    local rel="$1"
+    local content="$2"
+    local path
+
+    path="$(resolve_file_path "$rel")"
+    mkdir -p "$(dirname "$path")"
+
+    printf '%s' "$content" > "$path"
+
+    file_index_record "write" "$path" "$(sha256_file "$path" || true)" "$(wc -c < "$path")"
+    ok "wrote: $path"
+}
+
+file_append() {
+    local rel="$1"
+    local content="$2"
+    local path
+
+    path="$(resolve_file_path "$rel")"
+    mkdir -p "$(dirname "$path")"
+
+    printf '%s' "$content" >> "$path"
+
+    file_index_record "append" "$path" "$(sha256_file "$path" || true)" "$(wc -c < "$path")"
+    ok "appended: $path"
+}
+
+file_delete() {
+    local rel="$1"
+    local path
+
+    path="$(resolve_file_path "$rel")"
+    [[ -e "$path" ]] || die "not found: $path"
+
+    rm -rf -- "$path"
+
+    file_index_record "delete" "$path" "" "0"
+    ok "deleted: $path"
+}
+
+file_list() {
+    local rel="${1:-.}"
+    local path
+
+    path="$(resolve_file_path "$rel")"
+    [[ -d "$path" ]] || die "not a directory: $path"
+
+    find "$path" -mindepth 1 -maxdepth 4 -printf '%y %10s  %p\n' 2>/dev/null | sort -k3
+}
+
+cmd_file() {
+    local sub="${1:-}"
+    shift || true
+
+    case "$sub" in
+        create)
+            local rel="${1:-}"; shift || true
+            [[ -n "$rel" ]] || die "usage: ai file create PATH [CONTENT | - for stdin]"
+            local content="${1:-}"
+            [[ "$content" == "-" || -z "$content" && ! -t 0 ]] && content="$(cat)"
+            file_create "$rel" "$content"
+            ;;
+        read|cat)
+            local rel="${1:-}"
+            [[ -n "$rel" ]] || die "usage: ai file read PATH"
+            file_read "$rel"
+            ;;
+        write)
+            local rel="${1:-}"; shift || true
+            [[ -n "$rel" ]] || die "usage: ai file write PATH [CONTENT | - for stdin]"
+            local content="${1:-}"
+            [[ "$content" == "-" || -z "$content" && ! -t 0 ]] && content="$(cat)"
+            file_write "$rel" "$content"
+            ;;
+        append)
+            local rel="${1:-}"; shift || true
+            [[ -n "$rel" ]] || die "usage: ai file append PATH [CONTENT | - for stdin]"
+            local content="${1:-}"
+            [[ "$content" == "-" || -z "$content" && ! -t 0 ]] && content="$(cat)"
+            file_append "$rel" "$content"
+            ;;
+        delete|rm)
+            local rel="${1:-}"
+            [[ -n "$rel" ]] || die "usage: ai file delete PATH"
+            file_delete "$rel"
+            ;;
+        list|ls)
+            file_list "${1:-.}"
+            ;;
+        root)
+            printf '%s\n' "$FILE_ROOT"
+            ;;
+        *)
+            die "usage: ai file {create|read|write|append|delete|list|root} PATH [CONTENT]"
+            ;;
+    esac
+}
+
+# =============================================================================
+# DB / INDEX
 # =============================================================================
 
 cmd_db() {
@@ -2337,65 +2427,33 @@ cmd_db() {
     init_file_index
 
     case "$sub" in
-
         summary)
-            printf '\n'
-            printf '%sDB SUMMARY%s\n' \
-                "$C_CYAN" "$C_RESET"
+            printf '\n%sDB SUMMARY%s\n' "$C_CYAN" "$C_RESET"
+            printf '%s==============================%s\n' "$C_DIM" "$C_RESET"
+            printf 'Object store : %s\n' "$OBJECT_DIR"
+            printf 'File index   : %s\n' "$FILE_INDEX"
+            printf 'File root    : %s\n\n' "$FILE_ROOT"
 
-            printf '%s==============================%s\n' \
-                "$C_DIM" "$C_RESET"
+            printf 'Events by type:\n'
+            find "$OBJECT_DIR" -maxdepth 1 -name '*.json' -exec \
+                jq -r 'if .type then .type else "artifact:" + .kind end' {} \; 2>/dev/null |
+                sort | uniq -c | sort -rn
 
-            printf 'Objects : %s\n' "$OBJECT_DIR"
-            printf 'Files   : %s\n' "$FILE_INDEX"
-            printf 'Root    : %s\n\n' "$FILE_ROOT"
+            printf '\nTracked file actions:\n'
+            jq -r '.entries[].action' "$FILE_INDEX" 2>/dev/null |
+                sort | uniq -c | sort -rn
 
-            printf 'Events:\n'
-
-            find "$OBJECT_DIR" \
-                -maxdepth 1 \
-                -name '*.json' \
-                -exec jq -r \
-                    'if .type then .type else "artifact:" + .kind end' \
-                    {} \; \
-                2>/dev/null |
-                sort |
-                uniq -c |
-                sort -rn
-
-            printf '\nFile actions:\n'
-
-            jq -r \
-                '.entries[].action' \
-                "$FILE_INDEX" \
-                2>/dev/null |
-                sort |
-                uniq -c |
-                sort -rn
-
-            printf '\nObjects: %s\n' \
+            printf '\nTotal objects: %s\n' \
                 "$(find "$OBJECT_DIR" -maxdepth 1 -name '*.json' | wc -l)"
-
             printf '\n'
             ;;
 
         events)
-            local filter="${1:-}"
-
-            find "$OBJECT_DIR" \
-                -maxdepth 1 \
-                -name '*.json' \
-                -exec cat {} \; \
-                2>/dev/null |
-                jq -s \
-                    --arg type "$filter" \
-                    '
-                    if $type == ""
-                    then .
-                    else map(select(.type == $type))
-                    end
-                    | sort_by(.timestamp)
-                    '
+            local type_filter="${1:-}"
+            find "$OBJECT_DIR" -maxdepth 1 -name '*.json' -exec cat {} \; 2>/dev/null |
+                jq -s --arg t "$type_filter" \
+                    'if $t == "" then . else map(select(.type == $t)) end
+                     | sort_by(.timestamp)'
             ;;
 
         files)
@@ -2404,35 +2462,111 @@ cmd_db() {
 
         find)
             local hash="${1:-}"
-
-            [[ -n "$hash" ]] ||
-                die "usage: ai db find HASH"
-
-            local json="$OBJECT_DIR/$hash.json"
-            local text="$OBJECT_DIR/$hash.txt"
-
-            if [[ -f "$json" ]]; then
-                cat "$json"
-            fi
-
-            if [[ -f "$text" ]]; then
-                printf '\n--- content ---\n'
-                cat "$text"
-            fi
-
-            [[ -f "$json" || -f "$text" ]] ||
-                die "object not found: $hash"
+            [[ -n "$hash" ]] || die "usage: ai db find HASH"
+            local f="$OBJECT_DIR/$hash.json"
+            local t="$OBJECT_DIR/$hash.txt"
+            [[ -f "$f" ]] && cat "$f"
+            [[ -f "$t" ]] && { printf '\n---content---\n'; cat "$t"; }
+            [[ -f "$f" || -f "$t" ]] || die "no object with hash: $hash"
             ;;
 
         *)
-            die \
-                "usage: ai db {summary|events [type]|files|find HASH}"
+            die "usage: ai db {summary|events [type]|files|find HASH}"
             ;;
     esac
 }
 
 # =============================================================================
-# RUN
+# TEST
+# =============================================================================
+
+cmd_test() {
+    local model=""
+
+    model="$(resolve_model || true)"
+
+    if [[ -z "$model" || ! -f "$model" ]]; then
+        die "No GGUF model available. Run: ai install primary"
+    fi
+
+    verify_gguf "$model" ||
+        die "Resolved model is invalid: $model"
+
+    printf '\n'
+    info "LLAMA TEST"
+    printf 'Model : %s\n' "$model"
+    printf 'Size  : %s\n' \
+        "$(du -h "$model" | awk '{print $1}')"
+    printf '\n'
+
+    run_llama \
+        'Reply with exactly: OK'
+}
+
+# =============================================================================
+# SCAN (folder -> combined prompt -> engine)
+# =============================================================================
+
+cmd_scan() {
+    local dir="${1:-.}"
+    shift || true
+    local instruction="$*"
+
+    [[ -n "$instruction" ]] || die 'usage: ai scan DIR "instruction"'
+    [[ -d "$dir" ]] || die "not a directory: $dir"
+
+    local extensions="${AI_SCAN_EXTENSIONS:-html,htm,js,mjs,ts,css,json,sh,md}"
+    local depth="${AI_SCAN_DEPTH:-3}"
+
+    local -a find_expr=()
+    local ext
+    IFS=',' read -ra _exts <<< "$extensions"
+    for ext in "${_exts[@]}"; do
+        [[ ${#find_expr[@]} -gt 0 ]] && find_expr+=(-o)
+        find_expr+=(-iname "*.${ext}")
+    done
+
+    local max_total_bytes=$(( AI_CONTEXT * 3 ))
+    local max_file_bytes=4000
+
+    local combined=""
+    local included=0
+    local skipped=0
+    local f size content
+
+    while IFS= read -r -d '' f; do
+        size=$(wc -c < "$f" 2>/dev/null || echo 0)
+
+        if (( ${#combined} + size > max_total_bytes )); then
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        content="$(head -c "$max_file_bytes" -- "$f" 2>/dev/null || true)"
+        combined+=$'\n\n--- FILE: '"$f"$' ---\n'"$content"
+        included=$((included + 1))
+    done < <(find "$dir" -maxdepth "$depth" -type f \( "${find_expr[@]}" \) -print0 2>/dev/null | sort -z)
+
+    [[ -n "$combined" ]] || die "no matching files under $dir (extensions: $extensions â€” override with AI_SCAN_EXTENSIONS)"
+
+    info "scanning $included file(s) under $dir (skipped $skipped â€” over budget; raise AI_CONTEXT or narrow the folder)"
+
+    local prompt
+    prompt="$(cat <<EOF
+TASK:
+$instruction
+
+The following are files from $dir. Base your analysis only on their actual
+contents below, not on filenames alone.
+$combined
+EOF
+    )"
+
+    run_engine "$prompt"
+}
+
+# =============================================================================
+# RUN COMMAND
 # =============================================================================
 
 cmd_run() {
@@ -2451,41 +2585,38 @@ cmd_run() {
 }
 
 # =============================================================================
+# INTERACTIVE
+# =============================================================================
+
+cmd_chat() {
+    run_chat
+}
+
+# =============================================================================
 # HELP
 # =============================================================================
 
 cmd_help() {
-    cat <<EOF
+    cat <<'EOF'
 
-ai.sh $AI_VERSION
-
-DIRECT LLAMA.CPP CONTROLLER
+ai.sh 16.4.0
+Bulletproof direct-GGUF local AI controller.
 
 USAGE
 
   ai "prompt"
   ai run "prompt"
-  ai chat
-
-RUNTIME
-
-  llama cli -m /path/model.gguf
-
-  Prompt is delivered through stdin.
-
-COMMANDS
-
-  ai "prompt"
-  ai run "prompt"
 
   ai chat
+
   ai test
 
   ai models
+  ai model
+
   ai doctor
   ai status
   ai config
-  ai version
 
   ai install primary
   ai install fallback
@@ -2493,147 +2624,100 @@ COMMANDS
 
   ai hash "text"
 
-  ai scan DIR "instruction"
-
-  ai file create PATH CONTENT
-  ai file read PATH
-  ai file write PATH CONTENT
-  ai file append PATH CONTENT
+  ai file create PATH ["content" | - for stdin]
+  ai file read   PATH
+  ai file write  PATH ["content" | - for stdin]
+  ai file append PATH ["content" | - for stdin]
   ai file delete PATH
-  ai file list PATH
+  ai file list   [PATH]
   ai file root
 
+  ai scan DIR "instruction"
+
   ai db summary
-  ai db events [TYPE]
+  ai db events [type]
   ai db files
   ai db find HASH
 
-MODEL RESOLUTION
+FILE ACCESS
 
-  1. AI_MODEL_PATH
-  2. $MODEL_DIR/$AI_PRIMARY_FILE
-  3. Hugging Face primary cache
-  4. primary cache GGUF
-  5. AI_FALLBACK_PATH
-  6. fallback local GGUF
-  7. fallback Hugging Face cache
+  All "ai file" operations are sandboxed under FILE_ROOT
+  ($AI_HOME/files by default, override with AI_FILE_ROOT).
 
-MODEL INVARIANT
+  Every create/write/append/delete is recorded into:
+    - $DB_DIR/file_index.json   (structured, jq-queryable)
+    - $OBJECT_DIR/*.json        (content-addressed event ledger)
 
-  llama receives only a verified physical GGUF path.
-
-  Logical identifiers such as:
-
-    Qwen/Qwen2.5-Coder-3B-Instruct-GGUF:Q4_K_M
-
-  are never passed to llama.
-
-2PI / 8 POV
-
-    0°    analytical
-   45°    architectural
-   90°    critical
-  135°    creative
-  180°    implementation
-  225°    adversarial
-  270°    systems
-  315°    synthesis
-
-  AI_VIEWS=1..8
-
-RECURSION
-
-  AI_DEPTH=1
-
-  Example:
-
-    AI_DEPTH=2 ai "analyze this architecture"
-
-SYNTHESIS
-
-  AI_SYNTHESIS=true ai "design a local AI controller"
+  To operate outside the sandbox, export:
+    AI_ALLOW_UNSAFE_PATHS=true
 
 SCAN
 
-  ai scan ~/project "find architectural problems"
+  "ai scan DIR \"instruction\"" reads matching files under DIR (read-only,
+  NOT sandboxed â€” point it at any project folder), folds their contents
+  into one prompt, and runs it through the normal engine.
 
-  Default extensions:
+MODEL ARCHITECTURE
 
-    html,htm,js,mjs,ts,css,json,sh,md
+  Logical model identifiers are configuration only.
 
-  Override:
+  AI_MODEL
+       |
+       v
+  physical GGUF resolver
+       |
+       +--> $AI_HOME/models
+       |
+       +--> Hugging Face cache
+       |
+       +--> primary
+       |
+       +--> fallback
+       |
+       v
+  verified *.gguf
+       |
+       v
+  $LLAMA_CLI
+       |
+       v
+  inference
 
-    AI_SCAN_EXTENSIONS=py,rs,go ai scan DIR "..."
+PRIMARY
 
-  Depth:
+  Qwen/Qwen2.5-Coder-3B-Instruct-GGUF:Q4_K_M
 
-    AI_SCAN_DEPTH=3
+  Local:
+    $AI_HOME/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf
 
-  Per-file read limit:
+FALLBACK
 
-    AI_SCAN_FILE_BYTES=4000
+  Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M
 
-FILES
+  Local:
+    $AI_HOME/models/qwen2.5-1.5b-instruct-q4_k_m.gguf
 
-  Default sandbox:
+ORCHESTRATION
 
-    $FILE_ROOT
+  2PI / 8 POV
 
-  To explicitly allow paths outside the sandbox:
+    0Â°    analytical
+    45Â°   architectural
+    90Â°   critical
+    135Â°  creative
+    180Â°  implementation
+    225Â°  adversarial
+    270Â°  systems
+    315Â°  synthesis
 
-    AI_ALLOW_UNSAFE_PATHS=true
+SAFETY INVARIANT
 
-LEDGER
-
-  $OBJECT_DIR
-
-FILE INDEX
-
-  $FILE_INDEX
-
-RUNTIME OVERRIDE
-
-  LLAMA_CLI=/path/to/llama ai test
-
-OPTIONAL LLAMA FLAGS
-
-  The base runtime intentionally uses only:
-
-    llama cli -m MODEL
-
-  If your installed llama build accepts additional flags:
-
-    AI_LLAMA_FLAGS='--ctx-size 4096 --threads 8 --temp 0.65' ai test
-
-  This is optional.
-
-EXAMPLES
-
-  ai doctor
-
-  ai models
-
-  ai test
-
-  ai "explain this bash function"
-
-  ai scan ~/project "analyze the codebase"
-
-  AI_VIEWS=4 ai "quick architecture analysis"
-
-  AI_SYNTHESIS=true ai "design a robust local runtime"
-
-  AI_DEPTH=2 AI_SYNTHESIS=true ai "refine this architecture"
-
-SAFETY
-
-  llama is never invoked without:
-
-    - executable runtime
-    - physical model path
-    - regular model file
-    - non-empty model file
-    - valid GGUF magic
+  llama is never called unless:
+    - runtime exists
+    - model path is non-empty
+    - model path exists
+    - model path is a regular file
+    - GGUF magic is valid
 
 EOF
 }
@@ -2662,7 +2746,7 @@ main() {
 
         chat|repl)
             shift
-            run_chat "$@"
+            cmd_chat "$@"
             ;;
 
         test)
@@ -2730,3 +2814,4 @@ main() {
 # =============================================================================
 
 main "$@"
+

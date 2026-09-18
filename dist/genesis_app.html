@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Unattended AI Genesis Telemetry</title>
+    <style>
+        :root { --bg: #0b0f19; --panel: rgba(20, 26, 40, 0.85); --accent: #00f2fe; --text: #e6edf3; }
+        body { background: var(--bg); color: var(--text); font-family: monospace; margin: 0; padding: 20px; }
+        .grid { display: grid; grid-template-columns: 1fr; gap: 15px; max-width: 1200px; margin: 0 auto; }
+        .card { background: var(--panel); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 18px; }
+        .hash { color: var(--accent); font-weight: bold; word-break: break-all; }
+        #stream-log { max-height: 600px; overflow-y: auto; font-size: 0.85rem; }
+        .node { border-left: 3px solid var(--accent); background: rgba(0,0,0,0.2); padding: 10px; margin-bottom: 10px; border-radius: 0 4px 4px 0; }
+    </style>
+</head>
+<body>
+    <div class="grid">
+        <div class="card">
+            <h2>Unattended Daemon Engine</h2>
+            <div>State Hash: <span id="genesis-hash" class="hash">GENESIS_INIT</span></div>
+        </div>
+        <div class="card">
+            <h3>Live Ingest Output</h3>
+            <div id="stream-log"></div>
+        </div>
+    </div>
+    <script>
+        window.appendRealtimeNode = function(hash, payload) {
+            document.getElementById('genesis-hash').innerText = hash;
+            const log = document.getElementById('stream-log');
+            const entry = document.createElement('div');
+            entry.className = 'node';
+            entry.innerHTML = `<div><strong>[${new Date().toLocaleTimeString()}]</strong> <span class="hash">${hash.substring(0,16)}...</span></div><pre style="white-space:pre-wrap;">${payload}</pre>`;
+            log.prepend(entry);
+        };
+    </script>
+
+<script>window.appendRealtimeNode(`b9ed78262058bb7472f02343c2878bc373f4a124ac9d64b373b4bdcbaaea06cb`, `[36m[+] Initializing Unattended AI Environment at /home/loop/_[0m
+[33m[*] Checking system dependencies...[0m
+[32m[+] Installation Complete![0m
+
+Directory Structure:
+  Target Root : /home/loop/_
+  FIFO Pipe   : /home/loop/_/fifo/prompt.fifo
+  Output App  : /home/loop/_/dist/genesis_app.html
+
+Commands to start and test:
+  /home/loop/_/runner.sh start
+  /home/loop/_/runner.sh push "Generate responsive analytics widget"`);</script>
+
+<script>window.appendRealtimeNode(`d346d668747750712f8137cd6db4d9c8df38ccde86e100a6e985062517039158`, `[Thread-1] [36m[+] Initializing Unattended AI Environment at /home/loop/_[0m
+[33m[*] Checking system dependencies...[0m
+[32m[+] Installation Complete![0m
+
+Directory Structure:
+  Target Root : /home/loop/_
+  FIFO Pipe   : /home/loop/_/fifo/prompt.fifo
+  Output App  : /home/loop/_/dist/genesis_app.html
+
+Commands to start and test:
+  /home/loop/_/runner.sh start
+  /home/loop/_/runner.sh push "Generate responsive analytics widget"`);</script>
+</body>
+</html>

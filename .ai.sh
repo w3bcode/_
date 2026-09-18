@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# ai.sh v16.0.0
+# ai.sh v16.4.0
 # =============================================================================
 # Single-file local AI controller for llama.cpp (llama-cli), tuned for
 # proot-distro Debian on Android with modest RAM (~16GB or less).
@@ -22,7 +22,7 @@
 #   task hash
 #      |
 #      v
-#   2PI / 8 POV multiview  (sequential — safe for constrained RAM)
+#   2PI / 8 POV multiview  (sequential â€” safe for constrained RAM)
 #      |
 #      +---- analytical
 #      +---- architectural
@@ -76,7 +76,7 @@ IFS=$'\n\t'
 # VERSION
 # =============================================================================
 
-AI_VERSION="16.0.0"
+AI_VERSION="16.4.0"
 
 # =============================================================================
 # BASE PATHS
@@ -96,6 +96,9 @@ RUN_DIR="${AI_RUN_DIR:-$STATE_DIR/run}"
 SESSION_DIR="${AI_SESSION_DIR:-$STATE_DIR/sessions}"
 
 MODEL_DIR="${AI_MODEL_DIR:-$AI_HOME/models}"
+
+# Fixed-path error channel for subshell execution recovery
+LAST_ERROR_FILE="$RUN_DIR/last_error.log"
 
 mkdir -p \
     "$STATE_DIR" \
@@ -231,6 +234,7 @@ POV_NAME=""
 POV_ANGLE=""
 
 LLAMA_HELP_CACHE=""
+LLAMA_SUBCOMMAND_CACHE=""
 
 declare -a LLAMA_CMD=()
 declare -a CANDIDATE_FILES=()
@@ -270,6 +274,11 @@ on_error() {
     printf '%sCOMMAND:%s %s\n' \
         "$C_DIM" "$C_RESET" "$cmd" >&2
 
+    if [[ -f "$LAST_ERROR_FILE" ]] && have stat && have date; then
+        local age=$(( $(date +%s) - $(stat -c %Y "$LAST_ERROR_FILE" 2>/dev/null || echo 0) ))
+        (( age >= 0 && age <= 3 )) && show_last_error
+    fi
+
     exit "$rc"
 }
 
@@ -305,6 +314,13 @@ debug() {
 
     printf '%s[DEBUG]%s %s\n' \
         "$C_DIM" "$C_RESET" "$*" >&2
+}
+
+show_last_error() {
+    [[ -f "$LAST_ERROR_FILE" ]] || return 0
+
+    printf '%s[LLAMA ERROR]%s\n' "$C_RED" "$C_RESET" >&2
+    sed 's/^/  /' "$LAST_ERROR_FILE" >&2
 }
 
 have() {
@@ -698,6 +714,7 @@ check_runtime() {
 llama_help() {
     if [[ -z "$LLAMA_HELP_CACHE" ]]; then
         LLAMA_HELP_CACHE="$(
+            "$LLAMA_CLI" cli --help 2>&1 ||
             "$LLAMA_CLI" --help 2>&1 ||
             true
         )"
@@ -712,6 +729,18 @@ llama_supports() {
     llama_help |
         grep -Eq -- \
             "(^|[[:space:]])${option}([=[:space:]]|,|$)"
+}
+
+llama_uses_cli_subcommand() {
+    if [[ -z "$LLAMA_SUBCOMMAND_CACHE" ]]; then
+        if "$LLAMA_CLI" cli --help >/dev/null 2>&1; then
+            LLAMA_SUBCOMMAND_CACHE="yes"
+        else
+            LLAMA_SUBCOMMAND_CACHE="no"
+        fi
+    fi
+
+    [[ "$LLAMA_SUBCOMMAND_CACHE" == "yes" ]]
 }
 
 # =============================================================================
@@ -742,10 +771,9 @@ build_llama_command() {
         return 2
     }
 
-    LLAMA_CMD=(
-        "$LLAMA_CLI"
-        --model "$model"
-    )
+    LLAMA_CMD=("$LLAMA_CLI")
+    llama_uses_cli_subcommand && LLAMA_CMD+=(cli)
+    LLAMA_CMD+=(--model "$model")
 
     # Context.
     if llama_supports '--ctx-size'; then
@@ -860,49 +888,120 @@ run_llama() {
         return "$LAST_EXIT_CODE"
     }
 
-    stderr_file="$(safe_tmp llama-stderr)"
+    local prompt_file
+    prompt_file="$(safe_tmp llama-prompt)"
+    printf '%s' "$prompt" > "$prompt_file"
 
-    LLAMA_CMD+=(--prompt "$prompt")
-
-    if [[ "${AI_VERBOSE:-false}" == "true" ]]; then
-        printf '%sMODEL:%s %s\n' \
-            "$C_DIM" "$C_RESET" "$model"
-
-        printf '%sCOMMAND:%s' \
-            "$C_DIM" "$C_RESET"
-
-        printf ' %q' "${LLAMA_CMD[@]}"
-
-        printf '\n'
+    local approx_tokens=$(( ${#prompt} / 4 ))
+    if (( approx_tokens > AI_CONTEXT )); then
+        warn "Prompt is ~${approx_tokens} tokens but AI_CONTEXT=$AI_CONTEXT;" \
+             "it will likely be truncated. Scan fewer files or raise AI_CONTEXT."
     fi
 
-    debug "executing llama"
+    local attempt
+    local flipped_once="false"
 
-    if have timeout; then
-        output="$(
-            timeout \
-                "$AI_TIMEOUT" \
+    for (( attempt = 1; attempt <= 2; attempt++ )); do
+        if (( attempt > 1 )); then
+            build_llama_command "$model" || {
+                LAST_EXIT_CODE=$?
+                return "$LAST_EXIT_CODE"
+            }
+        fi
+
+        if llama_supports '--file'; then
+            LLAMA_CMD+=(--file "$prompt_file")
+        elif llama_supports '-f'; then
+            LLAMA_CMD+=(-f "$prompt_file")
+        else
+            local prompt_bytes=${#prompt}
+            if (( prompt_bytes > 65536 )); then
+                warn "Prompt is ${prompt_bytes} bytes and this llama-cli build has no --file/-f option;" \
+                     "large prompts can fail with 'Argument list too long' as a raw CLI argument."
+            fi
+            LLAMA_CMD+=(--prompt "$prompt")
+        fi
+
+        if llama_supports '--single-turn'; then
+            LLAMA_CMD+=(--single-turn)
+        elif llama_supports '-st'; then
+            LLAMA_CMD+=(-st)
+        fi
+
+        if llama_supports '--no-display-prompt'; then
+            LLAMA_CMD+=(--no-display-prompt)
+        fi
+
+        if [[ "${AI_VERBOSE:-false}" == "true" ]]; then
+            printf '%sMODEL:%s %s\n' "$C_DIM" "$C_RESET" "$model"
+            printf '%sCOMMAND:%s' "$C_DIM" "$C_RESET"
+            printf ' %q' "${LLAMA_CMD[@]}"
+            printf '\n'
+        fi
+
+        debug "executing llama (attempt $attempt)"
+
+        stderr_file="$(safe_tmp llama-stderr)"
+
+        if have timeout; then
+            if output="$(
+                timeout \
+                    "$AI_TIMEOUT" \
+                    "${LLAMA_CMD[@]}" \
+                    < /dev/null \
+                    2>"$stderr_file"
+            )"; then
+                rc=0
+            else
+                rc=$?
+            fi
+        else
+            if output="$(
                 "${LLAMA_CMD[@]}" \
+                < /dev/null \
                 2>"$stderr_file"
-        )"
+            )"; then
+                rc=0
+            else
+                rc=$?
+            fi
+        fi
 
-        rc=$?
-    else
-        output="$(
-            "${LLAMA_CMD[@]}" \
-            2>"$stderr_file"
-        )"
+        if [[ $rc -ne 0 ]]; then
+            LAST_ERROR="$(cat "$stderr_file" 2>/dev/null || true)"
 
-        rc=$?
-    fi
+            if [[ "$flipped_once" == "false" && "$LAST_ERROR" == *"unknown command"* ]]; then
+                if [[ "$LLAMA_SUBCOMMAND_CACHE" == "yes" ]]; then
+                    LLAMA_SUBCOMMAND_CACHE="no"
+                else
+                    LLAMA_SUBCOMMAND_CACHE="yes"
+                fi
+                flipped_once="true"
+
+                warn "llama cli/no-cli auto-detection looks wrong (${LAST_ERROR});" \
+                     "retrying once with the other invocation style"
+
+                continue
+            fi
+
+            break
+        fi
+
+        break
+    done
 
     if [[ $rc -ne 0 ]]; then
         LAST_EXIT_CODE=$rc
-        LAST_ERROR="$(cat "$stderr_file" 2>/dev/null || true)"
+
+        {
+            printf '[%s] exit=%s\n' "$(now_iso)" "$rc"
+            [[ -n "$LAST_ERROR" ]] && printf '%s\n' "$LAST_ERROR"
+            [[ -z "$LAST_ERROR" ]] && printf '(no stderr output â€” check AI_TIMEOUT=%s and that the model/args are valid)\n' "$AI_TIMEOUT"
+        } > "$LAST_ERROR_FILE" 2>/dev/null || true
 
         [[ -n "$LAST_ERROR" ]] &&
             log_event "llama_error" \
-                "$LAST_ERROR"
+                "$LAST_ERROR" >/dev/null
 
         return "$rc"
     fi
@@ -983,10 +1082,8 @@ EOF
 normalize_prompt() {
     local prompt="$1"
 
-    # Normalize CRLF.
     prompt="${prompt//$'\r'/}"
 
-    # Remove leading/trailing blank space without destroying internal newlines.
     prompt="$(
         printf '%s\n' "$prompt" |
         sed \
@@ -1245,12 +1342,13 @@ run_pov() {
             "$index"
     )"
 
-    info "POV $((index + 1))/8 — $POV_NAME @ ${POV_ANGLE}°"
+    info "POV $((index + 1))/8 â€” $POV_NAME @ ${POV_ANGLE}Â°"
 
     output="$(
         run_llama "$pov_prompt"
     )" || {
         warn "POV failed: $POV_NAME"
+        show_last_error
         return 1
     }
 
@@ -1397,6 +1495,7 @@ EOF
         run_llama "$synthesis_prompt"
     )" || {
         warn "Synthesis failed; using best candidate."
+        show_last_error
         best="$(best_candidate_index)"
 
         if [[ "$best" -ge 0 ]]; then
@@ -1512,11 +1611,6 @@ run_engine() {
 
         parent_hash="$result_hash"
 
-        # Recursion:
-        #
-        # The result becomes the semantic state for the next round.
-        #
-        # Prevent unbounded prompt growth by wrapping it as a continuation.
         if (( depth < AI_DEPTH )); then
             normalized=$(
                 cat <<EOF
@@ -1680,7 +1774,6 @@ download_with_curl() {
     verify_gguf "$temp" ||
         die "downloaded file is not a valid GGUF"
 
-    # Atomic replacement.
     mv -f \
         "$temp" \
         "$target"
@@ -1817,7 +1910,7 @@ cmd_models() {
     if [[ -n "$primary" ]]; then
         ok "PRIMARY MODEL READY"
     elif [[ -n "$fallback" ]]; then
-        warn "PRIMARY MISSING — FALLBACK READY"
+        warn "PRIMARY MISSING â€” FALLBACK READY"
     else
         warn "NO GGUF MODEL FOUND"
         printf '\n'
@@ -1881,11 +1974,9 @@ cmd_doctor() {
     printf '%s==============================%s\n\n' \
         "$C_DIM" "$C_RESET"
 
-    # Bash.
     printf 'Bash:\n'
     printf '  %s\n' "$BASH_VERSION"
 
-    # Runtime.
     printf '\nRuntime:\n'
     printf '  path: %s\n' "$LLAMA_CLI"
 
@@ -1893,6 +1984,14 @@ cmd_doctor() {
         ok "llama executable"
     else
         warn "llama executable missing"
+    fi
+
+    if [[ -x "$LLAMA_CLI" ]]; then
+        if llama_uses_cli_subcommand; then
+            printf '  invocation: %s cli --model ... (subcommand-style CLI)\n' "$LLAMA_CLI"
+        else
+            printf '  invocation: %s --model ... (flag-style CLI)\n' "$LLAMA_CLI"
+        fi
     fi
 
     if [[ -x "$LLAMA_CLI" ]]; then
@@ -1905,7 +2004,6 @@ cmd_doctor() {
         printf '  version: %s\n' "$version"
     fi
 
-    # Tools.
     printf '\nTools:\n'
 
     for tool in \
@@ -1926,7 +2024,6 @@ cmd_doctor() {
         fi
     done
 
-    # Model.
     printf '\nModels:\n'
 
     model="$(resolve_model || true)"
@@ -2036,17 +2133,6 @@ cmd_hash() {
 # =============================================================================
 # FILE CRUD (sandboxed)
 # =============================================================================
-#
-# All file operations are confined to FILE_ROOT by default. FILE_ROOT is a
-# normal directory under AI_HOME, not a system path, so "full CRUD access"
-# means the tool can freely create/read/update/delete its own working files
-# (notes, generated code, session exports, etc.) without touching the rest
-# of the phone/container.
-#
-# To operate outside FILE_ROOT (e.g. editing a project elsewhere in the
-# proot filesystem), export AI_ALLOW_UNSAFE_PATHS=true. This is opt-in
-# because an LLM-driven tool that can silently write/delete anywhere is a
-# real footgun on a shared filesystem.
 
 FILE_ROOT="${AI_FILE_ROOT:-$AI_HOME/files}"
 mkdir -p "$FILE_ROOT"
@@ -2059,8 +2145,6 @@ init_file_index() {
     fi
 }
 
-# Resolve a user-supplied path to an absolute path and enforce the sandbox
-# unless the user has explicitly opted out.
 resolve_file_path() {
     local input="$1"
     local abs=""
@@ -2071,7 +2155,6 @@ resolve_file_path() {
         abs="$FILE_ROOT/$input"
     fi
 
-    # Collapse .. / . without requiring the target to already exist.
     if have realpath; then
         abs="$(realpath -m -- "$abs")"
     else
@@ -2087,7 +2170,7 @@ resolve_file_path() {
             "$FILE_ROOT"/*|"$FILE_ROOT")
                 : ;;
             *)
-                die "path escapes sandbox ($FILE_ROOT): $abs — set AI_ALLOW_UNSAFE_PATHS=true to override"
+                die "path escapes sandbox ($FILE_ROOT): $abs â€” set AI_ALLOW_UNSAFE_PATHS=true to override"
                 ;;
         esac
     fi
@@ -2242,11 +2325,6 @@ cmd_file() {
 # =============================================================================
 # DB / INDEX
 # =============================================================================
-#
-# Everything the orchestrator does (genesis, task, pov, synthesis, round,
-# file_*) is already content-addressed into $OBJECT_DIR as small JSON
-# records via log_event/write_artifact. This section adds a way to query
-# that ledger and the file index without hand-rolling jq each time.
 
 cmd_db() {
     local sub="${1:-summary}"
@@ -2303,6 +2381,7 @@ cmd_db() {
             ;;
     esac
 }
+
 # =============================================================================
 # TEST
 # =============================================================================
@@ -2328,6 +2407,68 @@ cmd_test() {
 
     run_llama \
         'Reply with exactly: OK'
+}
+
+# =============================================================================
+# SCAN (folder -> combined prompt -> engine)
+# =============================================================================
+
+cmd_scan() {
+    local dir="${1:-.}"
+    shift || true
+    local instruction="$*"
+
+    [[ -n "$instruction" ]] || die 'usage: ai scan DIR "instruction"'
+    [[ -d "$dir" ]] || die "not a directory: $dir"
+
+    local extensions="${AI_SCAN_EXTENSIONS:-html,htm,js,mjs,ts,css,json,sh,md}"
+    local depth="${AI_SCAN_DEPTH:-3}"
+
+    local -a find_expr=()
+    local ext
+    IFS=',' read -ra _exts <<< "$extensions"
+    for ext in "${_exts[@]}"; do
+        [[ ${#find_expr[@]} -gt 0 ]] && find_expr+=(-o)
+        find_expr+=(-iname "*.${ext}")
+    done
+
+    local max_total_bytes=$(( AI_CONTEXT * 3 ))
+    local max_file_bytes=4000
+
+    local combined=""
+    local included=0
+    local skipped=0
+    local f size content
+
+    while IFS= read -r -d '' f; do
+        size=$(wc -c < "$f" 2>/dev/null || echo 0)
+
+        if (( ${#combined} + size > max_total_bytes )); then
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        content="$(head -c "$max_file_bytes" -- "$f" 2>/dev/null || true)"
+        combined+=$'\n\n--- FILE: '"$f"$' ---\n'"$content"
+        included=$((included + 1))
+    done < <(find "$dir" -maxdepth "$depth" -type f \( "${find_expr[@]}" \) -print0 2>/dev/null | sort -z)
+
+    [[ -n "$combined" ]] || die "no matching files under $dir (extensions: $extensions â€” override with AI_SCAN_EXTENSIONS)"
+
+    info "scanning $included file(s) under $dir (skipped $skipped â€” over budget; raise AI_CONTEXT or narrow the folder)"
+
+    local prompt
+    prompt="$(cat <<EOF
+TASK:
+$instruction
+
+The following are files from $dir. Base your analysis only on their actual
+contents below, not on filenames alone.
+$combined
+EOF
+    )"
+
+    run_engine "$prompt"
 }
 
 # =============================================================================
@@ -2364,7 +2505,7 @@ cmd_chat() {
 cmd_help() {
     cat <<'EOF'
 
-ai.sh 10.0.0
+ai.sh 16.4.0
 Bulletproof direct-GGUF local AI controller.
 
 USAGE
@@ -2397,6 +2538,8 @@ USAGE
   ai file list   [PATH]
   ai file root
 
+  ai scan DIR "instruction"
+
   ai db summary
   ai db events [type]
   ai db files
@@ -2413,6 +2556,12 @@ FILE ACCESS
 
   To operate outside the sandbox, export:
     AI_ALLOW_UNSAFE_PATHS=true
+
+SCAN
+
+  "ai scan DIR \"instruction\"" reads matching files under DIR (read-only,
+  NOT sandboxed â€” point it at any project folder), folds their contents
+  into one prompt, and runs it through the normal engine.
 
 MODEL ARCHITECTURE
 
@@ -2458,104 +2607,22 @@ ORCHESTRATION
 
   2PI / 8 POV
 
-    0°    analytical
-    45°   architectural
-    90°   critical
-    135°  creative
-    180°  implementation
-    225°  adversarial
-    270°  systems
-    315°  synthesis
-
-  Each candidate receives:
-
-    SHA-256 identity
-    structural scoring
-    directness scoring
-    completeness scoring
-    convergence ranking
-
-  Optional recursive rounds:
-
-    AI_DEPTH=1
-
-  Optional final synthesis:
-
-    AI_SYNTHESIS=true
-
-EXAMPLES
-
-  ai doctor
-
-  ai models
-
-  ai install primary
-
-  ai install fallback
-
-  ai test
-
-  ai "explain this bash function"
-
-  AI_DEPTH=2 ai "analyze this architecture"
-
-  AI_SYNTHESIS=true ai "design a robust local AI runtime"
-
-  AI_VIEWS=4 ai "quick analysis"
-
-  ai chat
-
-ENVIRONMENT
-
-  LLAMA_CLI
-  AI_MODEL
-  AI_CODER
-  AI_FALLBACK
-
-  AI_MODEL_DIR
-  AI_MODEL_PATH
-  AI_FALLBACK_PATH
-
-  AI_CONTEXT
-  AI_CTX
-
-  AI_BATCH
-  AI_BATCH_SIZE
-
-  AI_UBATCH
-  AI_UBATCH_SIZE
-
-  AI_PREDICT
-  AI_N_PREDICT
-
-  AI_THREADS
-  AI_GPU_LAYERS
-
-  AI_TEMPERATURE
-  AI_TEMP
-
-  AI_TOP_K
-  AI_TOP_P
-  AI_REPEAT_PENALTY
-
-  AI_TIMEOUT
-
-  AI_VIEWS
-  AI_DEPTH
-  AI_SYNTHESIS
-
-  AI_STATE_DIR
-  AI_SESSION
+    0Â°    analytical
+    45Â°   architectural
+    90Â°   critical
+    135Â°  creative
+    180Â°  implementation
+    225Â°  adversarial
+    270Â°  systems
+    315Â°  synthesis
 
 SAFETY INVARIANT
 
   llama is never called unless:
-
     - runtime exists
     - model path is non-empty
     - model path exists
     - model path is a regular file
-    - model path is non-empty
     - GGUF magic is valid
 
 EOF
@@ -2626,6 +2693,11 @@ main() {
         file|files)
             shift
             cmd_file "$@"
+            ;;
+
+        scan)
+            shift
+            cmd_scan "$@"
             ;;
 
         db)

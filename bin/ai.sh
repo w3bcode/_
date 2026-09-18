@@ -1,0 +1,1 @@
+/home/loop/_/ai.sh
