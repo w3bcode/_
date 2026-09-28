@@ -1,957 +1,228 @@
 #!/usr/bin/env bash
-# ============================================================================
-# AI // 2244.1122
-# Single-file Bash + Python3 + optional Node.js + llama.cpp controller
-#
-# Append-only architecture:
-#   prompt
-#     -> event
-#     -> transform
-#     -> capability gate
-#     -> resource governor
-#     -> llama
-#     -> observe
-#     -> validate
-#     -> SHA256 lineage
-#     -> JSONL ledger
-#
-# No Ollama.
-# No Python dependency for basic execution.
-# Python3 enhances structured hashing/ledger operations.
-# Node.js is optional and never required for core execution.
-# ============================================================================
-
+# GENESIS/HX unified local controller v17.0.0
+# One CLI + state tree + llama.cpp adapter; eight POVs run sequentially.
 set -Eeuo pipefail
 IFS=$'\n\t'
+umask 077
 
-AI_VERSION="2244.1122.2"
-AI_NAME="ai"
+AI_VERSION=17.0.0
+AI_HOME="${AI_HOME:-${HOME:-/home/loop}/.ai}"
+STATE="${AI_STATE_DIR:-$AI_HOME/state}"
+DB="$STATE/db"; OBJECTS="$DB/objects"; RUN="$STATE/run"; LOG="$STATE/logs"; SESS="$STATE/sessions"
+WORKSPACE="${AI_WORKSPACE:-$AI_HOME/workspace}"
+MODEL_DIR="${AI_MODEL_DIR:-$AI_HOME/models}"
+LEDGER="${AI_LEDGER_FILE:-$DB/ledger.jsonl}"
+INDEX="$DB/file_index.json"
+LLAMA_CLI="${LLAMA_CLI:-${HOME:-/home/loop}/.local/bin/llama}"
+PRIMARY="${AI_MODEL_PATH:-$MODEL_DIR/qwen2.5-coder-3b-instruct-q4_k_m.gguf}"
+FALLBACK="${AI_FALLBACK_PATH:-$MODEL_DIR/qwen2.5-1.5b-instruct-q4_k_m.gguf}"
+CTX="${AI_CONTEXT:-2048}"; BATCH="${AI_BATCH:-128}"; UBATCH="${AI_UBATCH:-64}"
+PREDICT="${AI_PREDICT:-384}"; THREADS="${AI_THREADS:-4}"; TIMEOUT="${AI_TIMEOUT:-600}"
+TEMP="${AI_TEMPERATURE:-0.65}"; TOPK="${AI_TOP_K:-40}"; TOPP="${AI_TOP_P:-0.95}"
+REPEAT="${AI_REPEAT_PENALTY:-1.10}"; VIEWS="${AI_VIEWS:-8}"; DEPTH="${AI_DEPTH:-1}"
+SYNTH="${AI_SYNTHESIS:-true}"; SESSION="${AI_SESSION:-default}"
+mkdir -p "$OBJECTS" "$RUN" "$LOG" "$SESS" "$WORKSPACE" "$MODEL_DIR"
+[[ -f "$INDEX" ]] || printf '{"version":1,"files":[]}\n' > "$INDEX"
+if [[ -t 1 ]]; then C=$'\033[36m'; R=$'\033[0m'; Y=$'\033[33m'; else C='';R='';Y='';fi
+say(){ printf '%s[GENESIS]%s %s\n' "$C" "$R" "$*"; }
+warn(){ printf '%s[WARN]%s %s\n' "$Y" "$R" "$*" >&2; }
+die(){ printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+now(){ date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+esc(){ local x=$1; x=${x//\\/\\\\}; x=${x//\"/\\\"}; x=${x//$'\n'/\\n}; x=${x//$'\r'/\\r}; x=${x//$'\t'/\\t}; printf %s "$x"; }
+hash_text(){ if have sha256sum; then printf %s "$1"|sha256sum|awk '{print $1}'; else printf %s "$1"|shasum -a 256|awk '{print $1}'; fi; }
+hash_file(){ if have sha256sum; then sha256sum "$1"|awk '{print $1}'; else shasum -a 256 "$1"|awk '{print $1}'; fi; }
+is_gguf(){ [[ -s "$1" && "$(head -c4 "$1" 2>/dev/null || true)" == GGUF ]]; }
+json_valid(){ if have jq; then jq -e . "$1" >/dev/null; elif have python3; then python3 -c 'import json,sys;json.load(open(sys.argv[1]))' "$1"; else return 2; fi; }
 
-ROOT="${AI_ROOT:-${HOME}/_}"
-AI_HOME="${AI_HOME:-${HOME}/.ai}"
-STATE="${AI_STATE:-${AI_HOME}/.ai-state}"
+event(){
+  local type=$1 payload=${2:-} ts parent h line
+  ts=$(now); line=$(tail -n1 "$LEDGER" 2>/dev/null || true); parent=GENESIS
+  if [[ -n "$line" ]] && have jq; then parent=$(jq -r '.hash // "GENESIS"' <<<"$line"); fi
+  h=$(hash_text "$ts|$type|$parent|$payload")
+  printf '{"timestamp":"%s","type":"%s","parent":"%s","hash":"%s","payload":"%s"}\n' "$(esc "$ts")" "$(esc "$type")" "$(esc "$parent")" "$h" "$(esc "$payload")" >> "$LEDGER"
+  printf %s "$h"
+}
+artifact(){
+  local kind=$1 body=$2 parent=${3:-} h
+  h=$(hash_text "$body")
+  [[ -f "$OBJECTS/$h.txt" ]] || printf %s "$body" > "$OBJECTS/$h.txt"
+  printf '{"hash":"%s","kind":"%s","parent":"%s","created":"%s"}\n' "$h" "$(esc "$kind")" "$(esc "$parent")" "$(now)" > "$OBJECTS/$h.json"
+  printf %s "$h"
+}
+resolve_model(){
+  MODEL_PATH=; MODEL_TIER=none
+  if [[ -f "$PRIMARY" ]] && is_gguf "$PRIMARY"; then MODEL_PATH=$PRIMARY; MODEL_TIER=primary
+  elif [[ -f "$FALLBACK" ]] && is_gguf "$FALLBACK"; then MODEL_PATH=$FALLBACK; MODEL_TIER=fallback
+  else return 1; fi
+}
+validate_config(){
+  local n v
+  for n in CTX BATCH UBATCH PREDICT THREADS TIMEOUT VIEWS DEPTH; do v=${!n}; [[ "$v" =~ ^[0-9]+$ ]] || die "$n must be an integer"; done
+  ((CTX>0&&BATCH>0&&UBATCH>0&&PREDICT>0&&THREADS>0&&VIEWS>=1&&VIEWS<=8&&DEPTH>=1&&DEPTH<=16)) || die "invalid numeric configuration"
+}
 
-MODEL_DIR="${AI_MODEL_DIR:-${AI_HOME}/models}"
-RUN_DIR="${STATE}/run"
-LOG_DIR="${STATE}/log"
-DB_DIR="${STATE}/db"
-OBJ_DIR="${STATE}/objects"
-SESSION_DIR="${STATE}/sessions"
-
-LEDGER="${DB_DIR}/events.jsonl"
-STATE_JSON="${DB_DIR}/state.json"
-LAST_ERROR="${RUN_DIR}/last_error.log"
-
-mkdir -p \
-    "$AI_HOME" \
-    "$MODEL_DIR" \
-    "$RUN_DIR" \
-    "$LOG_DIR" \
-    "$DB_DIR" \
-    "$OBJ_DIR" \
-    "$SESSION_DIR"
-
-# ---------------------------------------------------------------------------
-# Defaults
-# ---------------------------------------------------------------------------
-
-AI_MODEL="${AI_MODEL:-${MODEL_DIR}/qwen2.5-coder-3b-instruct-q4_k_m.gguf}"
-AI_THREADS="${AI_THREADS:-8}"
-AI_CONTEXT="${AI_CONTEXT:-4096}"
-AI_BATCH="${AI_BATCH:-256}"
-AI_UBATCH="${AI_UBATCH:-128}"
-AI_PREDICT="${AI_PREDICT:-512}"
-AI_TIMEOUT="${AI_TIMEOUT:-600}"
-
-AI_TEMP="${AI_TEMP:-0.65}"
-AI_TOP_K="${AI_TOP_K:-40}"
-AI_TOP_P="${AI_TOP_P:-0.95}"
-AI_REPEAT="${AI_REPEAT:-1.10}"
-
-AI_DIRECTION="${AI_DIRECTION:-balanced}"
-AI_MODE="${AI_MODE:-normal}"
-AI_GRADE="${AI_GRADE:-0}"
-
-AI_SEQUENCE="${AI_SEQUENCE:-0}"
-AI_PARENT_HASH="${AI_PARENT_HASH:-GENESIS}"
-
-# bounded by design
-AI_MAX_BRANCHES="${AI_MAX_BRANCHES:-4}"
-AI_MAX_PROMPT_BYTES="${AI_MAX_PROMPT_BYTES:-32768}"
-
-# ---------------------------------------------------------------------------
-# Runtime discovery
-# ---------------------------------------------------------------------------
-
-find_llama() {
-    local candidates=(
-        "${LLAMA_CLI:-}"
-        "${HOME}/.local/bin/llama"
-        "/home/linuxbrew/.linuxbrew/bin/llama"
-        "$(command -v llama 2>/dev/null || true)"
-        "$(command -v llama-cli 2>/dev/null || true)"
-    )
-
-    local p
-    for p in "${candidates[@]}"; do
-        [[ -n "$p" ]] || continue
-        [[ -x "$p" ]] && {
-            printf '%s\n' "$p"
-            return 0
-        }
+# The sole inference adapter. Detects dispatcher (`llama cli`) vs classic binary.
+declare -a BASE=() CMD=()
+HELP_TEXT=""
+detect_adapter(){
+  [[ -x "$LLAMA_CLI" ]] || { warn "llama runtime missing: $LLAMA_CLI"; return 127; }
+  local h; h=$("$LLAMA_CLI" --help 2>&1 || true)
+  if grep -Eq '(^|[[:space:]])cli([[:space:]]|$)' <<<"$h"; then BASE=("$LLAMA_CLI" cli); else BASE=("$LLAMA_CLI"); fi
+  HELP_TEXT=$("${BASE[@]}" --help 2>&1 || true)
+}
+supports(){ grep -Eq -- "(^|[[:space:]])$1([=[:space:]]|,|$)" <<<"$HELP_TEXT"; }
+infer(){
+  local prompt=$1 model=${2:-$MODEL_PATH} out='' rc=0 err="$RUN/llama.stderr"
+  [[ -n "$model" && -f "$model" && -s "$model" ]] || { warn "unresolved model path"; return 2; }
+  is_gguf "$model" || { warn "model is not valid GGUF"; return 2; }
+  detect_adapter || return $?
+  CMD=("${BASE[@]}" --model "$model")
+  if supports '--ctx-size'; then CMD+=(--ctx-size "$CTX"); elif supports '-c'; then CMD+=(-c "$CTX"); fi
+  if supports '--batch-size'; then CMD+=(--batch-size "$BATCH"); elif supports '-b'; then CMD+=(-b "$BATCH"); fi
+  supports '--ubatch-size' && CMD+=(--ubatch-size "$UBATCH")
+  if supports '--predict'; then CMD+=(--predict "$PREDICT"); elif supports '-n'; then CMD+=(-n "$PREDICT"); fi
+  if supports '--threads'; then CMD+=(--threads "$THREADS"); elif supports '-t'; then CMD+=(-t "$THREADS"); fi
+  supports '--temp' && CMD+=(--temp "$TEMP")
+  supports '--top-k' && CMD+=(--top-k "$TOPK")
+  supports '--top-p' && CMD+=(--top-p "$TOPP")
+  supports '--repeat-penalty' && CMD+=(--repeat-penalty "$REPEAT")
+  supports '--single-turn' && CMD+=(--single-turn)
+  if supports '--prompt'; then CMD+=(--prompt "$prompt")
+  elif supports '-p'; then CMD+=(-p "$prompt"); fi
+  if [[ "${CMD[-1]:-}" == "$prompt" ]]; then
+    if have timeout; then out=$(timeout "$TIMEOUT" "${CMD[@]}" 2>"$err") || rc=$?; else out=$("${CMD[@]}" 2>"$err") || rc=$?; fi
+  else
+    if have timeout; then out=$(printf %s "$prompt"|timeout "$TIMEOUT" "${CMD[@]}" 2>"$err") || rc=$?; else out=$(printf %s "$prompt"|"${CMD[@]}" 2>"$err") || rc=$?; fi
+  fi
+  if ((rc)); then warn "llama rc=$rc: $(tail -n6 "$err" 2>/dev/null|tr '\n' ' ')"; event inference_error "rc=$rc model=$model" >/dev/null; return "$rc"; fi
+  printf %s "$out"
+}
+NAMES=(analytical architectural critical creative implementation adversarial systems synthesis)
+ANGLES=(0 45 90 135 180 225 270 315)
+declare -a FILES=() SCORES=() CNAMES=()
+score_text(){
+  local t=$1 w s=0 d=0
+  w=$(awk '{n+=NF}END{print n+0}' <<<"$t")
+  grep -Eq '(^|[[:space:]])([0-9]+\.|- |\* )' <<<"$t" && ((s+=1)) || true
+  grep -Eiq 'because|therefore|however|implementation|solution|constraint' <<<"$t" && ((s+=1)) || true
+  grep -q ':' <<<"$t" && ((s+=1)) || true
+  grep -Eiq 'answer|solution|implement|use|change|run|configure|fix' <<<"$t" && ((d+=1)) || true
+  ((${#t}>200)) && ((d+=1)) || true
+  awk -v w="$w" -v s="$s" -v d="$d" 'BEGIN{l=(w>=100?100:w>=50?80:w>=20?60:w>=8?30:0);printf "%.3f",l*.2+(s/3*100)*.2+(d/2*100)*.2+(s>=2?100:s*50)*.3+5}'
+}
+run_engine(){
+  local original=$1 task genesis depth i name pp out h score best bs result bundle
+  validate_config; [[ -n "$original" ]] || die "empty prompt"
+  resolve_model || die "no valid GGUF at $PRIMARY or $FALLBACK"
+  genesis=$(hash_text "$(now)|$AI_VERSION|$original"); task=$(hash_text "$genesis|$original")
+  event genesis "genesis=$genesis" >/dev/null; event task "task=$task" >/dev/null
+  say "model=$MODEL_TIER views=$VIEWS depth=$DEPTH genesis=$genesis"
+  for ((depth=1;depth<=DEPTH;depth++)); do
+    FILES=(); SCORES=(); CNAMES=()
+    for ((i=0;i<VIEWS;i++)); do
+      name=${NAMES[$i]}; say "round $depth/$DEPTH · POV $((i+1))/$VIEWS $name @ ${ANGLES[$i]}°"
+      pp=$(cat <<EOF
+You are the $name perspective in a multi-view analysis.
+TASK: $original
+VIEW: $name at ${ANGLES[$i]} degrees
+GENESIS: $genesis
+TASK HASH: $task
+Give a focused useful analysis. State assumptions, separate facts from inference, identify constraints and testable steps. Do not claim tool execution. Return only this perspective.
+EOF
+)
+      out=$(infer "$pp" "$MODEL_PATH") || { warn "POV $name failed"; continue; }
+      [[ -n "$out" ]] || continue
+      h=$(artifact "pov:$name" "$out" "$task"); score=$(score_text "$out")
+      FILES+=("$h"); SCORES+=("$score"); CNAMES+=("$name")
+      event pov "task=$task pov=$name angle=${ANGLES[$i]} hash=$h score=$score" >/dev/null
     done
-
-    return 1
-}
-
-LLAMA="$(find_llama || true)"
-
-# ---------------------------------------------------------------------------
-# SHA256
-# ---------------------------------------------------------------------------
-
-sha256_text() {
-    local value="${1-}"
-
-    if command -v sha256sum >/dev/null 2>&1; then
-        printf '%s' "$value" |
-            sha256sum |
-            awk '{print $1}'
-        return
+    ((${#FILES[@]}>0)) || die "all POV executions failed"
+    best=0; bs=${SCORES[0]}
+    for ((i=1;i<${#FILES[@]};i++)); do if awk -v a="${SCORES[$i]}" -v b="$bs" 'BEGIN{exit !(a>b)}'; then best=$i; bs=${SCORES[$i]}; fi; done
+    result=$(cat "$OBJECTS/${FILES[$best]}.txt")
+    if [[ "${SYNTH,,}" == true && ${#FILES[@]} -gt 1 ]]; then
+      bundle="TASK: $original"$'\n\n'"CANDIDATES:"
+      for ((i=0;i<${#FILES[@]};i++)); do bundle+=$'\n\n'"--- ${CNAMES[$i]} score=${SCORES[$i]} ---"$'\n'"$(cat "$OBJECTS/${FILES[$i]}.txt")"; done
+      bundle+=$'\n\n'"Synthesize a coherent response, reconcile contradictions, retain constraints, avoid unsupported claims. Return only the final answer."
+      result=$(infer "$bundle" "$MODEL_PATH") || { warn "synthesis failed; selecting top candidate"; result=$(cat "$OBJECTS/${FILES[$best]}.txt"); }
+      h=$(artifact synthesis "$result" "$task"); event synthesis "task=$task hash=$h" >/dev/null
     fi
-
-    if command -v openssl >/dev/null 2>&1; then
-        printf '%s' "$value" |
-            openssl dgst -sha256 -r |
-            awk '{print $1}'
-        return
-    fi
-
-    if command -v python3 >/dev/null 2>&1; then
-        printf '%s' "$value" |
-            python3 -c '
-import sys,hashlib
-print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())
-'
-        return
-    fi
-
-    return 127
+    h=$(artifact "round:$depth" "$result" "$task"); event round "depth=$depth task=$task result=$h" >/dev/null
+    if ((depth<DEPTH)); then original="Original task: $1"$'\n\n'"Prior result: $result"$'\n\n'"Continue by resolving gaps and improving precision."; task=$(hash_text "$genesis|$original|depth=$((depth+1))"); fi
+  done
+  printf '%s\n' "$result"
 }
-
-sha256_file() {
-    local file="$1"
-
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$file" | awk '{print $1}'
-    elif command -v openssl >/dev/null 2>&1; then
-        openssl dgst -sha256 -r "$file" | awk '{print $1}'
-    else
-        python3 - "$file" <<'PY'
-import hashlib
-import sys
-h = hashlib.sha256()
-with open(sys.argv[1], "rb") as f:
-    for block in iter(lambda: f.read(1048576), b""):
-        h.update(block)
-print(h.hexdigest())
-PY
-    fi
+status(){
+  printf 'GENESIS/HX %s\nRuntime: %s\nModel: %s (%s)\nContext=%s Threads=%s Views=%s Depth=%s Synthesis=%s\nState: %s\nWorkspace: %s\n' "$AI_VERSION" "$LLAMA_CLI" "${MODEL_PATH:-unresolved}" "$MODEL_TIER" "$CTX" "$THREADS" "$VIEWS" "$DEPTH" "$SYNTH" "$STATE" "$WORKSPACE"
 }
-
-# ---------------------------------------------------------------------------
-# Time
-# ---------------------------------------------------------------------------
-
-utc_now() {
-    date -u '+%Y-%m-%dT%H:%M:%S.%NZ'
+doctor(){
+  printf 'Bash %s\n' "$BASH_VERSION"
+  for x in sha256sum shasum jq python3 timeout node; do have "$x" && echo "$x OK" || echo "$x optional/missing"; done
+  [[ -x "$LLAMA_CLI" ]] && "$LLAMA_CLI" --version 2>&1|head -n1 || warn "llama missing"
+  resolve_model && printf 'GGUF %s (%s)\n' "$MODEL_PATH" "$MODEL_TIER" || warn "no verified GGUF"
 }
-
-epoch_now() {
-    date +%s
+index_workspace(){
+  local tmp="$RUN/index.$$" f rel h first=true
+  printf '{"version":1,"generated":"%s","files":[' "$(now)" > "$tmp"
+  while IFS= read -r -d '' f; do
+    rel=${f#"$WORKSPACE"/}; h=$(hash_file "$f")
+    [[ $first == true ]] || printf ',' >> "$tmp"; first=false
+    printf '{"path":"%s","sha256":"%s","bytes":%s}' "$(esc "$rel")" "$h" "$(wc -c <"$f"|tr -d ' ')" >> "$tmp"
+  done < <(find "$WORKSPACE" -type f -print0)
+  printf ']}\n' >> "$tmp"
+  json_valid "$tmp" || { rm -f "$tmp"; die "index validation failed (jq or python3 required)"; }
+  mv -f "$tmp" "$INDEX"; say "index updated: $INDEX"
 }
-
-# ---------------------------------------------------------------------------
-# Python structured-data bridge
-# ---------------------------------------------------------------------------
-
-py() {
-    command -v python3 >/dev/null 2>&1 || return 127
-
-    python3 - "$@"
+file_cmd(){
+  local op=${1:-} path=${2:-} data=${3:-} target
+  [[ -n "$op" && -n "$path" ]] || die "usage: ai file create|read|write|append|delete PATH [DATA]"
+  case "$path" in /*) target=$path;; *) target="$WORKSPACE/$path";; esac
+  case "$op" in
+    create) [[ ! -e "$target" ]] || die "already exists"; mkdir -p "$(dirname "$target")"; printf %s "$data" > "$target";;
+    read) [[ -f "$target" ]] || die "not found"; cat "$target";;
+    write) mkdir -p "$(dirname "$target")"; [[ ! -f "$target" ]] || cp -p "$target" "$target.bak.$(date +%s)"; printf %s "$data" > "$RUN/write.$$"; mv -f "$RUN/write.$$" "$target";;
+    append) mkdir -p "$(dirname "$target")"; printf %s "$data" >> "$target";;
+    delete) [[ -f "$target" ]] || die "not found"; cp -p "$target" "$target.bak.$(date +%s)"; rm -f "$target";;
+    *) die "unknown file operation: $op";;
+  esac
+  event file "$op $target" >/dev/null
 }
-
-json_escape() {
-    py <<'PY'
-import json,sys
-print(json.dumps(sys.stdin.read().rstrip("\n"), ensure_ascii=False))
-PY
-}
-
-# ---------------------------------------------------------------------------
-# Optional Node bridge
-# ---------------------------------------------------------------------------
-
-node_available() {
-    command -v node >/dev/null 2>&1
-}
-
-node_transform() {
-    local input="${1-}"
-
-    node_available || {
-        printf '%s' "$input"
-        return 0
-    }
-
-    NODE_INPUT="$input" node <<'JS'
-const input = process.env.NODE_INPUT ?? "";
-const result = {
-    length: [...input].length,
-    bytes: Buffer.byteLength(input, "utf8"),
-    normalized: input.normalize("NFC")
-};
-process.stdout.write(JSON.stringify(result));
-JS
-}
-
-# ---------------------------------------------------------------------------
-# State
-# ---------------------------------------------------------------------------
-
-load_state() {
-    [[ -f "$STATE_JSON" ]] || {
-        printf '%s\n' \
-            '{"sequence":0,"parent":"GENESIS","direction":"balanced","mode":"normal","grade":0}' \
-            > "$STATE_JSON"
-        return
-    }
-
-    if command -v python3 >/dev/null 2>&1; then
-        AI_SEQUENCE="$(
-            python3 - "$STATE_JSON" <<'PY'
-import json,sys
-try:
-    x=json.load(open(sys.argv[1]))
-    print(int(x.get("sequence",0)))
-except Exception:
-    print(0)
-PY
-        )"
-
-        AI_PARENT_HASH="$(
-            python3 - "$STATE_JSON" <<'PY'
-import json,sys
-try:
-    x=json.load(open(sys.argv[1]))
-    print(x.get("parent","GENESIS"))
-except Exception:
-    print("GENESIS")
-PY
-        )"
-    fi
-}
-
-save_state() {
-    local sequence="$1"
-    local parent="$2"
-    local direction="$3"
-    local mode="$4"
-    local grade="$5"
-
-    if command -v python3 >/dev/null 2>&1; then
-        python3 - \
-            "$STATE_JSON" \
-            "$sequence" \
-            "$parent" \
-            "$direction" \
-            "$mode" \
-            "$grade" <<'PY'
-import json,sys,tempfile,os
-
-path=sys.argv[1]
-obj={
-    "sequence":int(sys.argv[2]),
-    "parent":sys.argv[3],
-    "direction":sys.argv[4],
-    "mode":sys.argv[5],
-    "grade":int(sys.argv[6])
-}
-
-fd,tmp=tempfile.mkstemp(prefix=".state.",dir=os.path.dirname(path))
-with os.fdopen(fd,"w",encoding="utf-8") as f:
-    json.dump(obj,f,separators=(",",":"),ensure_ascii=False)
-    f.write("\n")
-
-os.replace(tmp,path)
-PY
-    else
-        printf \
-            '{"sequence":%s,"parent":"%s","direction":"%s","mode":"%s","grade":%s}\n' \
-            "$sequence" "$parent" "$direction" "$mode" "$grade" \
-            > "$STATE_JSON"
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# Event creation
-# ---------------------------------------------------------------------------
-
-event_hash() {
-    local sequence="$1"
-    local timestamp="$2"
-    local prompt_hash="$3"
-    local direction="$4"
-    local mode="$5"
-    local grade="$6"
-    local parent="$7"
-
-    sha256_text \
-        "${AI_VERSION}|seq=${sequence}|time=${timestamp}|prompt=${prompt_hash}|direction=${direction}|mode=${mode}|grade=${grade}|parent=${parent}"
-}
-
-crossfire_hash() {
-    local origin="$1"
-    local reference="$2"
-    local grade="$3"
-
-    sha256_text \
-        "${AI_VERSION}|crossfire|origin=${origin}|reference=${reference}|grade=${grade}"
-}
-
-# ---------------------------------------------------------------------------
-# Resource governor
-# ---------------------------------------------------------------------------
-
-memory_percent() {
-    if [[ -r /proc/meminfo ]]; then
-        awk '
-            /MemTotal:/ {total=$2}
-            /MemAvailable:/ {avail=$2}
-            END {
-                if (total > 0)
-                    printf "%.0f\n",100*((total-avail)/total)
-                else
-                    print 0
-            }
-        ' /proc/meminfo
-    else
-        printf '0\n'
-    fi
-}
-
-pressure_level() {
-    local used
-    used="$(memory_percent)"
-
-    if (( used >= 90 )); then
-        printf 'P3\n'
-    elif (( used >= 75 )); then
-        printf 'P2\n'
-    elif (( used >= 55 )); then
-        printf 'P1\n'
-    else
-        printf 'P0\n'
-    fi
-}
-
-govern() {
-    local p
-    p="$(pressure_level)"
-
-    case "$p" in
-        P0)
-            AI_THREADS="${AI_THREADS_BASE:-8}"
-            AI_CONTEXT="${AI_CONTEXT_BASE:-4096}"
-            AI_PREDICT="${AI_PREDICT_BASE:-512}"
-            ;;
-        P1)
-            AI_THREADS=6
-            AI_CONTEXT=3072
-            AI_PREDICT=384
-            ;;
-        P2)
-            AI_THREADS=4
-            AI_CONTEXT=2048
-            AI_PREDICT=256
-            ;;
-        P3)
-            AI_THREADS=2
-            AI_CONTEXT=1024
-            AI_PREDICT=128
-            ;;
-    esac
-
-    printf '%s\n' "$p"
-}
-
-# ---------------------------------------------------------------------------
-# Prompt transformation
-# ---------------------------------------------------------------------------
-
-normalize_prompt() {
-    local prompt="$1"
-
-    # Preserve meaning while normalizing control characters.
-    printf '%s' "$prompt" |
-        tr '\r' ' ' |
-        tr '\000' ' ' |
-        head -c "$AI_MAX_PROMPT_BYTES"
-}
-
-transform_prompt() {
-    local prompt="$1"
-    local mode="$2"
-    local direction="$3"
-
-    case "$mode:$direction" in
-        normal:*)
-            printf '%s' "$prompt"
-            ;;
-
-        explore:ascending)
-            printf '%s\n\n' "$prompt"
-            printf '%s\n' \
-                "Explore independent interpretations, identify assumptions, and distinguish evidence from hypothesis."
-            ;;
-
-        verify:descending)
-            printf '%s\n\n' "$prompt"
-            printf '%s\n' \
-                "Reduce to the smallest reproducible claim set. Verify hashes, references, constraints, and observable results."
-            ;;
-
-        retro:*)
-            printf '%s\n\n' "$prompt"
-            printf '%s\n' \
-                "Compare the current request with its recorded parent state. Do not invent missing history."
-            ;;
-
-        *)
-            printf '%s' "$prompt"
-            ;;
-    esac
-}
-
-# ---------------------------------------------------------------------------
-# Capability gate
-# ---------------------------------------------------------------------------
-
-capability_check() {
-    local action="${1:-model}"
-
-    case "$action" in
-        model|read|hash|ledger|inspect)
-            return 0
-            ;;
-
-        write)
-            [[ "${AI_ALLOW_WRITE:-0}" == 1 ]]
-            ;;
-
-        execute)
-            [[ "${AI_ALLOW_EXEC:-0}" == 1 ]]
-            ;;
-
-        network)
-            [[ "${AI_ALLOW_NETWORK:-0}" == 1 ]]
-            ;;
-
-        *)
-            return 1
-            ;;
-    esac
-}
-
-# ---------------------------------------------------------------------------
-# Llama execution
-# ---------------------------------------------------------------------------
-
-run_llama() {
-    local prompt="$1"
-    local output_file="$2"
-
-    : > "$LAST_ERROR"
-
-    [[ -n "$LLAMA" ]] || {
-        printf 'llama executable not found\n' > "$LAST_ERROR"
-        return 127
-    }
-
-    [[ -f "$AI_MODEL" ]] || {
-        printf 'model not found: %s\n' "$AI_MODEL" > "$LAST_ERROR"
-        return 66
-    }
-
-    local prompt_file
-    prompt_file="$(mktemp "${RUN_DIR}/prompt.XXXXXX")"
-
-    printf '%s' "$prompt" > "$prompt_file"
-
-    timeout "$AI_TIMEOUT" \
-        "$LLAMA" cli \
-        -m "$AI_MODEL" \
-        -c "$AI_CONTEXT" \
-        -b "$AI_BATCH" \
-        -ub "$AI_UBATCH" \
-        -t "$AI_THREADS" \
-        -n "$AI_PREDICT" \
-        --temp "$AI_TEMP" \
-        --top-k "$AI_TOP_K" \
-        --top-p "$AI_TOP_P" \
-        --repeat-penalty "$AI_REPEAT" \
-        < "$prompt_file" \
-        > "$output_file" \
-        2> "$LAST_ERROR"
-
-    local rc=$?
-    rm -f "$prompt_file"
-
-    return "$rc"
-}
-
-# ---------------------------------------------------------------------------
-# Ledger
-# ---------------------------------------------------------------------------
-
-append_event() {
-    local timestamp="$1"
-    local sequence="$2"
-    local parent="$3"
-    local event="$4"
-    local prompt_hash="$5"
-    local result_hash="$6"
-    local direction="$7"
-    local mode="$8"
-    local grade="$9"
-    local pressure="${10}"
-    local status="${11}"
-    local crossfire="${12}"
-
-    if command -v python3 >/dev/null 2>&1; then
-        python3 - \
-            "$LEDGER" \
-            "$timestamp" \
-            "$sequence" \
-            "$parent" \
-            "$event" \
-            "$prompt_hash" \
-            "$result_hash" \
-            "$direction" \
-            "$mode" \
-            "$grade" \
-            "$pressure" \
-            "$status" \
-            "$crossfire" <<'PY'
-import json,sys,os
-
-(
-    path,
-    timestamp,
-    sequence,
-    parent,
-    event,
-    prompt_hash,
-    result_hash,
-    direction,
-    mode,
-    grade,
-    pressure,
-    status,
-    crossfire
-)=sys.argv[1:]
-
-obj={
-    "version":"2244.1122.2",
-    "datetime":timestamp,
-    "sequence":int(sequence),
-    "parent":parent,
-    "event":event,
-    "prompt_sha256":prompt_hash,
-    "result_sha256":result_hash,
-    "direction":direction,
-    "mode":mode,
-    "grade":int(grade),
-    "pressure":pressure,
-    "status":status,
-    "crossfire_sha256":crossfire
-}
-
-with open(path,"a",encoding="utf-8") as f:
-    f.write(json.dumps(obj,separators=(",",":"),ensure_ascii=False))
-    f.write("\n")
-PY
-    else
-        printf \
-            '{"version":"2244.1122.2","datetime":"%s","sequence":%s,"parent":"%s","event":"%s","prompt_sha256":"%s","result_sha256":"%s","direction":"%s","mode":"%s","grade":%s,"pressure":"%s","status":"%s","crossfire_sha256":"%s"}\n' \
-            "$timestamp" "$sequence" "$parent" "$event" \
-            "$prompt_hash" "$result_hash" "$direction" \
-            "$mode" "$grade" "$pressure" "$status" "$crossfire" \
-            >> "$LEDGER"
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# Main pipeline
-# ---------------------------------------------------------------------------
-
-process_prompt() {
-    local raw="$1"
-
-    load_state
-
-    local timestamp
-    timestamp="$(utc_now)"
-
-    local sequence=$((AI_SEQUENCE + 1))
-    local parent="$AI_PARENT_HASH"
-
-    local normalized
-    normalized="$(normalize_prompt "$raw")"
-
-    local prompt_hash
-    prompt_hash="$(sha256_text "$normalized")"
-
-    local transformed
-    transformed="$(
-        transform_prompt \
-            "$normalized" \
-            "$AI_MODE" \
-            "$AI_DIRECTION"
-    )"
-
-    local pressure
-    pressure="$(govern)"
-
-    local event
-    event="$(event_hash \
-        "$sequence" \
-        "$timestamp" \
-        "$prompt_hash" \
-        "$AI_DIRECTION" \
-        "$AI_MODE" \
-        "$AI_GRADE" \
-        "$parent"
-    )"
-
-    local crossfire
-    crossfire="$(
-        crossfire_hash \
-            "$event" \
-            "${AI_REFERENCE:-origin}" \
-            "$AI_GRADE"
-    )"
-
-    local output
-    output="${RUN_DIR}/result-${sequence}.txt"
-
-    printf '\n[%s] seq=%s mode=%s direction=%s pressure=%s\n' \
-        "$timestamp" \
-        "$sequence" \
-        "$AI_MODE" \
-        "$AI_DIRECTION" \
-        "$pressure" \
-        >&2
-
-    if ! capability_check model; then
-        printf 'model capability unavailable\n' >&2
-        return 77
-    fi
-
-    if run_llama "$transformed" "$output"; then
-        local status="complete"
-        local result_hash
-        result_hash="$(sha256_file "$output")"
-
-        append_event \
-            "$timestamp" \
-            "$sequence" \
-            "$parent" \
-            "$event" \
-            "$prompt_hash" \
-            "$result_hash" \
-            "$AI_DIRECTION" \
-            "$AI_MODE" \
-            "$AI_GRADE" \
-            "$pressure" \
-            "$status" \
-            "$crossfire"
-
-        save_state \
-            "$sequence" \
-            "$event" \
-            "$AI_DIRECTION" \
-            "$AI_MODE" \
-            "$AI_GRADE"
-
-        AI_SEQUENCE="$sequence"
-        AI_PARENT_HASH="$event"
-
-        cat "$output"
-        return 0
-    fi
-
-    local rc=$?
-    local result_hash
-    result_hash="$(sha256_text "ERROR:${rc}:$(cat "$LAST_ERROR" 2>/dev/null || true)")"
-
-    append_event \
-        "$timestamp" \
-        "$sequence" \
-        "$parent" \
-        "$event" \
-        "$prompt_hash" \
-        "$result_hash" \
-        "$AI_DIRECTION" \
-        "$AI_MODE" \
-        "$AI_GRADE" \
-        "$pressure" \
-        "failed:${rc}" \
-        "$crossfire"
-
-    printf 'execution failed rc=%s\n' "$rc" >&2
-    cat "$LAST_ERROR" >&2 2>/dev/null || true
-
-    return "$rc"
-}
-
-# ---------------------------------------------------------------------------
-# Interactive commands
-# ---------------------------------------------------------------------------
-
-show_status() {
-    load_state
-
-    printf '%s\n' \
-        "AI_VERSION   = $AI_VERSION" \
-        "SEQUENCE     = $AI_SEQUENCE" \
-        "PARENT       = $AI_PARENT_HASH" \
-        "MODEL        = $AI_MODEL" \
-        "LLAMA        = ${LLAMA:-missing}" \
-        "DIRECTION    = $AI_DIRECTION" \
-        "MODE         = $AI_MODE" \
-        "GRADE        = $AI_GRADE" \
-        "PRESSURE     = $(pressure_level)" \
-        "MEMORY       = $(memory_percent)%" \
-        "LEDGER       = $LEDGER"
-}
-
-show_last() {
-    [[ -f "$LEDGER" ]] || return 0
-    tail -n "${1:-1}" "$LEDGER"
-}
-
-show_help() {
-    cat <<'EOF'
-ai — 2244/1122 interactive controller
-
-Execution:
-  ai run "prompt"
-  ai repl
-
-State:
-  ai status
-  ai last [N]
-
-Modes:
-  ai mode normal
-  ai mode explore
-  ai mode retro
-  ai mode verify
-
-Directions:
-  ai direction ascending
-  ai direction balanced
-  ai direction descending
-
-Grades:
-  ai grade 0..3
-
-References:
-  ai reference NAME
-
-Hashes:
-  ai hash "text"
-  ai crossfire HASH REFERENCE GRADE
-
-System:
-  ai doctor
-  ai env
-  ai help
-
-Environment:
-  AI_MODEL
-  AI_THREADS
-  AI_CONTEXT
-  AI_PREDICT
-  AI_TIMEOUT
-  AI_ALLOW_WRITE=1
-  AI_ALLOW_EXEC=1
-  AI_ALLOW_NETWORK=1
+help(){
+cat <<'EOF'
+GENESIS/HX v17.0.0 — unified local llama.cpp controller
+ai "prompt" | ai run "prompt" | ai chat
+ai status | doctor | models | test | config | version
+ai hash TEXT | ledger [N] | index
+ai file create|read|write|append|delete PATH [DATA]
+Settings: LLAMA_CLI AI_MODEL_PATH AI_FALLBACK_PATH AI_CONTEXT AI_BATCH
+AI_UBATCH AI_PREDICT AI_THREADS AI_TIMEOUT AI_VIEWS(1..8) AI_DEPTH(1..16)
+AI_SYNTHESIS=true|false AI_WORKSPACE AI_STATE_DIR
 EOF
 }
-
-doctor() {
-    printf 'AI doctor\n'
-    printf '---------\n'
-
-    command -v bash >/dev/null &&
-        printf 'bash       OK\n' ||
-        printf 'bash       MISSING\n'
-
-    command -v sha256sum >/dev/null &&
-        printf 'sha256sum  OK\n' ||
-        printf 'sha256sum  FALLBACK\n'
-
-    command -v python3 >/dev/null &&
-        printf 'python3    OK\n' ||
-        printf 'python3    OPTIONAL/MISSING\n'
-
-    node_available &&
-        printf 'node       OK\n' ||
-        printf 'node       OPTIONAL/MISSING\n'
-
-    [[ -n "$LLAMA" ]] &&
-        printf 'llama      OK: %s\n' "$LLAMA" ||
-        printf 'llama      MISSING\n'
-
-    [[ -f "$AI_MODEL" ]] &&
-        printf 'model      OK: %s\n' "$AI_MODEL" ||
-        printf 'model      MISSING: %s\n' "$AI_MODEL"
-
-    printf 'memory     %s%%\n' "$(memory_percent)"
-    printf 'pressure   %s\n' "$(pressure_level)"
+chat(){
+  local p ans
+  while printf 'hx> ' && IFS= read -r p; do
+    case "$p" in /exit|/quit) break;; /help) help;; /status) status;; '') continue;; *) ans=$(run_engine "$p"); printf '%s\n' "$ans"; printf '[%s] USER\n%s\n[%s] ASSISTANT\n%s\n' "$(now)" "$p" "$(now)" "$ans" >> "$SESS/${SESSION//[^a-zA-Z0-9_.-]/_}.log";; esac
+  done
 }
-
-repl() {
-    printf 'AI interactive REPL — type /help or /quit\n'
-
-    while IFS= read -r -p 'ai> ' line; do
-        [[ -n "$line" ]] || continue
-
-        case "$line" in
-            /quit|/exit)
-                break
-                ;;
-
-            /help)
-                show_help
-                ;;
-
-            /status)
-                show_status
-                ;;
-
-            /last*)
-                set -- $line
-                show_last "${2:-1}"
-                ;;
-
-            /mode\ *)
-                AI_MODE="${line#"/mode "}"
-                printf 'mode=%s\n' "$AI_MODE"
-                ;;
-
-            /direction\ *)
-                AI_DIRECTION="${line#"/direction "}"
-                printf 'direction=%s\n' "$AI_DIRECTION"
-                ;;
-
-            /grade\ *)
-                AI_GRADE="${line#"/grade "}"
-                printf 'grade=%s\n' "$AI_GRADE"
-                ;;
-
-            /reference\ *)
-                AI_REFERENCE="${line#"/reference "}"
-                printf 'reference=%s\n' "$AI_REFERENCE"
-                ;;
-
-            *)
-                process_prompt "$line"
-                ;;
-        esac
-    done
+main(){
+  local cmd=${1:-help}
+  case "$cmd" in
+    help|-h|--help) help;; version|-V|--version) echo "$AI_VERSION";;
+    status) resolve_model >/dev/null 2>&1 || true; status;;
+    doctor) doctor;;
+    models|model) resolve_model && printf '%s (%s)\n' "$MODEL_PATH" "$MODEL_TIER" || warn "no valid GGUF";;
+    config) printf 'AI_HOME=%s\nSTATE=%s\nWORKSPACE=%s\nLLAMA_CLI=%s\nPRIMARY=%s\nFALLBACK=%s\n' "$AI_HOME" "$STATE" "$WORKSPACE" "$LLAMA_CLI" "$PRIMARY" "$FALLBACK";;
+    hash) shift; hash_text "$*"; printf '\n';;
+    ledger) tail -n "${2:-10}" "$LEDGER" 2>/dev/null || true;;
+    index) index_workspace;;
+    file) shift; file_cmd "$@";;
+    chat|repl) chat;;
+    test) resolve_model || die "no model"; infer 'Reply with exactly: OK' "$MODEL_PATH"; printf '\n';;
+    run) shift; local p="${*:-}"; [[ -n "$p" ]] || p=$(cat); run_engine "$p";;
+    *) run_engine "$*";;
+  esac
 }
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-main() {
-    load_state
-
-    case "${1:-repl}" in
-        run)
-            shift
-            process_prompt "${*:-}"
-            ;;
-
-        repl)
-            repl
-            ;;
-
-        status)
-            show_status
-            ;;
-
-        last)
-            show_last "${2:-1}"
-            ;;
-
-        hash)
-            sha256_text "${2:-}"
-            ;;
-
-        crossfire)
-            crossfire_hash \
-                "${2:?origin hash}" \
-                "${3:?reference}" \
-                "${4:-0}"
-            ;;
-
-        mode)
-            AI_MODE="${2:?mode}"
-            printf 'mode=%s\n' "$AI_MODE"
-            ;;
-
-        direction)
-            AI_DIRECTION="${2:?direction}"
-            printf 'direction=%s\n' "$AI_DIRECTION"
-            ;;
-
-        grade)
-            AI_GRADE="${2:?grade}"
-            printf 'grade=%s\n' "$AI_GRADE"
-            ;;
-
-        reference)
-            AI_REFERENCE="${2:?reference}"
-            printf 'reference=%s\n' "$AI_REFERENCE"
-            ;;
-
-        doctor)
-            doctor
-            ;;
-
-        env)
-            env | grep '^AI_' | sort
-            ;;
-
-        help|-h|--help)
-            show_help
-            ;;
-
-        *)
-            process_prompt "$*"
-            ;;
-    esac
-}
-
-trap '
-    rc=$?
-    printf "[ai] interrupted/error rc=%s at %s\n" "$rc" "$(utc_now)" >&2
-    exit "$rc"
-' ERR
-
 main "$@"
+
