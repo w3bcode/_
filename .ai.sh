@@ -60,7 +60,15 @@ AI_RECALL_TOP="${AI_RECALL_TOP:-8}"
 AI_MAX_FILE_BYTES="${AI_MAX_FILE_BYTES:-262144}"
 AI_MAX_PROMPT_BYTES="${AI_MAX_PROMPT_BYTES:-120000}"
 AI_AUTO_REVIEW="${AI_AUTO_REVIEW:-1}"
-AI_AUTO_REINDEX="${AI_AUTO_REINDEX:-1}"
+AI_AUTO_REINDEX="${AI_AUTO_REINDEX:-0}"
+AI_REALTIME="${AI_REALTIME:-1}"
+AI_REALTIME_HOST="${AI_REALTIME_HOST:-https://mempool.space}"
+AI_REALTIME_TIMEOUT="${AI_REALTIME_TIMEOUT:-12}"
+AI_BTC_NETWORK="${AI_BTC_NETWORK:-mainnet}"
+AI_BTC_GENESIS_HASH="${AI_BTC_GENESIS_HASH:-000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26}"
+AI_BTC_GENESIS_ADDRESS="${AI_BTC_GENESIS_ADDRESS:-1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa}"
+AI_REALTIME_RETENTION="${AI_REALTIME_RETENTION:-256}"
+AI_CHARSET="${AI_CHARSET:-ascii-safe}"
 AI_EXCLUDE="${AI_EXCLUDE:-.git .ai .cache node_modules target dist build __pycache__}" 
 PI='3.141592653589793238462643383279502884'
 
@@ -75,26 +83,6 @@ DESCS=(
   'systems/lifecycle/resource projection'
   'synthesis/reconciliation projection'
 )
-
-# =============================================================================
-# OPTIONAL REALTIME EXTERNAL STATE
-# =============================================================================
-
-AI_REALTIME="${AI_REALTIME:-1}"
-AI_REALTIME_HOST="${AI_REALTIME_HOST:-https://api.coingecko.com}"
-AI_REALTIME_ASSET="${AI_REALTIME_ASSET:-bitcoin}"
-AI_REALTIME_CURRENCY="${AI_REALTIME_CURRENCY:-usd}"
-AI_REALTIME_TIMEOUT="${AI_REALTIME_TIMEOUT:-12}"
-
-REALTIME_DIR="$STATE/realtime"
-REALTIME_LAST="$REALTIME_DIR/latest.json"
-REALTIME_LEDGER="$REALTIME_DIR/ledger.jsonl"
-
-mkdir -p "$REALTIME_DIR"
-
-# further back-to-topic...
-
-
 
 mkdir -p "$STATE" "$OBJECTS" "$RUN" "$SESS" "$LOG" "$MODEL_DIR"
 [[ -f "$DB" ]] || printf '{"version":"%s","genesis":"2244-1","last":{},"records":[],"files":{},"chunks":{},"reviews":{},"stats":{}}
@@ -116,6 +104,136 @@ sha256_file(){ sha256sum -- "$1" | awk '{print $1}'; }
 sha512_text(){ printf '%s' "${1-}" | sha512sum | awk '{print $1}'; }
 md5_text(){ printf '%s' "${1-}" | md5sum | awk '{print $1}'; }
 bytes_file(){ wc -c <"$1" | tr -d ' '; }
+
+# -----------------------------------------------------------------------------
+# Canonical text / datetime / modulo-7 / UTF-8 + ASCII-family primitives.
+# These are serialization/indexing primitives, not cryptographic key derivation.
+# -----------------------------------------------------------------------------
+text_utf8_normalize(){
+  local s="${1-}"
+  if have iconv; then
+    printf '%s' "$s" | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null || printf '%s' "$s"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+ascii_family(){
+  local s="${1-}" printable controls nonascii
+  printable="$(LC_ALL=C printf '%s' "$s" | tr -cd '\x20-\x7e' | wc -c | tr -d ' ')"
+  controls="$(LC_ALL=C printf '%s' "$s" | tr -cd '\x00-\x1f\x7f' | wc -c | tr -d ' ')"
+  nonascii="$(LC_ALL=C printf '%s' "$s" | tr -cd '\x80-\xff' | wc -c | tr -d ' ')"
+  jq -cn --argjson printable "$printable" --argjson controls "$controls" --argjson nonascii "$nonascii" \
+    '{encoding:"utf-8",ascii:{printable:$printable,control:$controls,non_ascii_byte_count:$nonascii},family:(if $nonascii>0 then "utf8-extended" elif $controls>0 then "ascii-control" else "ascii-printable" end)}'
+}
+
+canonical_record(){
+  local text="${1-}" source="${2:-cli}" ts mod7 normalized family
+  ts="$(now)"
+  mod7="$((ts % 7))"
+  normalized="$(text_utf8_normalize "$text")"
+  family="$(ascii_family "$normalized")"
+  jq -cn --arg ts "$ts" --arg iso "$(iso)" --argjson mod7 "$mod7" --arg source "$source" --arg text "$normalized" --argjson family "$family" \
+    '{schema:"GENESIS/HX/TEXT/1",timestamp:$ts,iso:$iso,datetime_mod7:$mod7,source:$source,encoding:"UTF-8",text:$text,character_family:$family}'
+}
+
+state_hash(){
+  local text="${1-}" source="${2:-cli}" rec previous payload sha1 legacy chain
+  rec="$(canonical_record "$text" "$source")"
+  previous="$(cat "$STATE/hash.tip" 2>/dev/null || printf 'GENESIS')"
+  payload="$(printf '%s\n%s' "$previous" "$rec")"
+  sha1="unavailable"
+  have sha1sum && sha1="$(printf '%s' "$rec" | sha1sum | awk '{print $1}')"
+  legacy="$(md5_text "$rec")"
+  chain="$(printf '%s' "$payload" | sha256sum | awk '{print $1}')"
+  printf '%s\n' "$chain" >"$STATE/hash.tip"
+  jq -cn --argjson record "$rec" --arg previous "$previous" --arg sha256 "$(printf '%s' "$rec" | sha256sum | awk '{print $1}')" --arg sha1 "$sha1" --arg md5 "$legacy" --arg chain "$chain" \
+    '{record:$record,previous_hash:$previous,payload_sha256:$sha256,sha1_legacy:$sha1,md5_legacy:$md5,chain_hash:$chain}'
+}
+
+btc_fetch(){
+  local path="$1" url="${AI_REALTIME_HOST%/}$path" out
+  have curl || return 127
+  if ! out="$(curl -fsS --connect-timeout 5 --max-time "$AI_REALTIME_TIMEOUT" -H 'Accept: application/json,text/plain' -- "$url")"; then
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
+btc_state(){
+  [[ "$AI_REALTIME" == 1 ]] || { jq -cn '{enabled:false}'; return; }
+  local tip_height tip_hash fees mempool price nowts bucket mod7 genesis_rebase payload h
+  if tip_height="$(btc_fetch /api/blocks/tip/height 2>/dev/null)"; then :; else tip_height=null; fi; [[ -n "$tip_height" ]] || tip_height=null
+  if tip_hash="$(btc_fetch /api/blocks/tip/hash 2>/dev/null)"; then :; else tip_hash=null; fi; [[ -n "$tip_hash" ]] || tip_hash=null
+  if fees="$(btc_fetch /api/v1/fees/recommended 2>/dev/null)"; then :; else fees='{}'; fi; [[ -n "$fees" ]] || fees='{}'
+  if mempool="$(btc_fetch /api/mempool 2>/dev/null)"; then :; else mempool='{}'; fi; [[ -n "$mempool" ]] || mempool='{}'
+  if price="$(btc_fetch /api/v1/prices 2>/dev/null)"; then :; else price='{}'; fi; [[ -n "$price" ]] || price='{}'
+  nowts="$(now)"; bucket="$((nowts/600))"; mod7="$((bucket%7))"
+  genesis_rebase="$(sha256_text "$AI_BTC_GENESIS_HASH|$tip_height|$tip_hash")"
+  payload="$(jq -cn --arg network "$AI_BTC_NETWORK" --arg genesis "$AI_BTC_GENESIS_HASH" --arg address "$AI_BTC_GENESIS_ADDRESS" --arg tip_height "$tip_height" --arg tip_hash "$tip_hash" --argjson fees "$fees" --argjson mempool "$mempool" --argjson price "$price" --argjson bucket "$bucket" --argjson mod7 "$mod7" --arg rebase "$genesis_rebase" --argjson ts "$nowts" \
+    '{schema:"GENESIS/HX/BTC/2",timestamp:$ts,network:$network,origin:{height:0,genesis_block_hash:$genesis,genesis_output_reference:$address},tip:{height:($tip_height|tonumber? // null),hash:(if $tip_hash=="null" then null else $tip_hash end)},temporal:{bucket_10m:$bucket,mod7:$mod7},fees:$fees,mempool:$mempool,market:$price,rebase_hash:$rebase}')"
+  h="$(sha256_text "$payload")"
+  mkdir -p "$STATE/realtime"
+  printf '%s\n' "$payload" >"$STATE/realtime/btc-latest.json"
+  jq -cn --argjson state "$payload" --arg hash "$h" '{state:$state,payload_sha256:$hash}' >>"$STATE/realtime/btc-ledger.jsonl"
+  if [[ -n "${AI_REALTIME_RETENTION:-}" && "$AI_REALTIME_RETENTION" =~ ^[0-9]+$ ]]; then
+    tail -n "$AI_REALTIME_RETENTION" "$STATE/realtime/btc-ledger.jsonl" >"$RUN/btc-ledger.$$" && mv -f "$RUN/btc-ledger.$$" "$STATE/realtime/btc-ledger.jsonl"
+  fi
+  printf '%s\n' "$payload"
+}
+
+btc_address_info(){
+  local addr="${1:-}"
+  [[ -n "$addr" ]] || die 'usage: ai btc address ADDRESS'
+  [[ "$addr" != *[[:space:]]* ]] || die 'invalid address: whitespace'
+  local out
+  out="$(btc_fetch "/api/v1/validate-address/$addr" 2>/dev/null)" || die 'address lookup failed'
+  jq -c --arg address "$addr" '. + {query:$address,network:"mainnet",source:"mempool.space"}' <<<"$out"
+}
+
+btc_tx_info(){
+  local tx="${1:-}"
+  [[ "$tx" =~ ^[0-9A-Fa-f]{64}$ ]] || die 'usage: ai btc tx TXID'
+  btc_fetch "/api/tx/$tx" | jq -c .
+}
+
+btc_block_info(){
+  local ref="${1:-tip}" out
+  if [[ "$ref" == tip ]]; then
+    ref="$(btc_fetch /api/blocks/tip/hash)" || die 'tip lookup failed'
+  elif [[ "$ref" =~ ^[0-9]+$ ]]; then
+    ref="$(btc_fetch "/api/block-height/$ref")" || die 'height lookup failed'
+  fi
+  out="$(btc_fetch "/api/block/$ref")" || die 'block lookup failed'
+  jq -c . <<<"$out"
+}
+
+btc_manifest(){
+  mkdir -p "$STATE/realtime"
+  local b="$(btc_state)" h
+  h="$(sha256_text "$b")"
+  jq -cn --argjson btc "$b" --arg hash "$h" --arg charset "$AI_CHARSET" \
+    '{schema:"GENESIS/HX/MANIFEST/2",charset:$charset,btc:$btc,manifest_sha256:$hash}' >"$STATE/realtime/manifest.json"
+  cat "$STATE/realtime/manifest.json"
+}
+
+# SOAP-compatible local CRUD envelope. It does not transmit anything.
+soap_crud(){
+  local op="${1:-}" path="${2:-}" data="${3:-}" key rec safe
+  [[ -n "$op" && -n "$path" ]] || die 'usage: ai soap create|read|write|append|delete PATH [DATA]'
+  case "$op" in create|read|write|append|delete) ;; *) die 'unsupported SOAP CRUD operation';; esac
+  safe="$(assert_under_root "$path")"
+  key="$(sha256_text "$(now)|$(( $(now) % 7 ))|$op|$safe")"
+  case "$op" in
+    create|write|append|delete) crud "$op" "$safe" "$data" >/dev/null;;
+    read) data="$(crud read "$safe")";;
+  esac
+  rec="$(canonical_record "$data" "soap:$op")"
+  local esc_path esc_record
+  esc_path="$(printf '%s' "$safe" | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g')"
+  esc_record="$(printf '%s' "$rec" | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g')"
+  printf '%s\n' "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body><crudResponse><key>$key</key><operation>$op</operation><path>$esc_path</path><record>$esc_record</record></crudResponse></soap:Body></soap:Envelope>"
+}
 
 require(){ for x in "$@"; do have "$x" || die "missing dependency: $x"; done; }
 
@@ -648,98 +766,10 @@ run_engine(){
   normalized="$(normalize_text "$input")"
   genesis="$(sha256_text "$(now)|2244-1|$AI_VERSION|$normalized")"
   task="$(sha256_text "$genesis|$normalized")"
-
-realtime_state() {
-  local url raw ts sha1 sha256 bytes mod7
-
-  [[ "$AI_REALTIME" == 1 ]] || {
-    printf '{"enabled":false}\n'
-    return 0
-  }
-
-  have curl || {
-    warn "curl unavailable; realtime state skipped"
-    return 0
-  }
-
-  ts="$(now)"
-
-  url="${AI_REALTIME_HOST}/api/v3/simple/price?ids=${AI_REALTIME_ASSET}&vs_currencies=${AI_REALTIME_CURRENCY}&include_last_updated_at=true"
-
-  raw="$(
-    curl \
-      --fail \
-      --silent \
-      --show-error \
-      --location \
-      --connect-timeout 5 \
-      --max-time "$AI_REALTIME_TIMEOUT" \
-      -H 'Accept: application/json' \
-      "$url"
-  )" || {
-    warn "realtime provider unavailable"
-    persist_event realtime_error "provider=coingecko asset=$AI_REALTIME_ASSET" >/dev/null || true
-    return 0
-  }
-
-  [[ -n "$raw" ]] || {
-    warn "realtime provider returned empty response"
-    return 0
-  }
-
-  # Validate JSON before using it.
-  jq empty <<<"$raw" >/dev/null 2>&1 || {
-    warn "realtime response was not valid JSON"
-    return 0
-  }
-
-  bytes="$(printf '%s' "$raw" | wc -c | tr -d ' ')"
-  sha256="$(printf '%s' "$raw" | sha256sum | awk '{print $1}')"
-  sha1="$(printf '%s' "$raw" | sha1sum | awk '{print $1}')"
-  mod7="$((ts % 7))"
-
-  jq -cn \
-    --arg provider "coingecko" \
-    --arg endpoint "$url" \
-    --arg asset "$AI_REALTIME_ASSET" \
-    --arg currency "$AI_REALTIME_CURRENCY" \
-    --arg raw "$raw" \
-    --arg sha256 "$sha256" \
-    --arg sha1 "$sha1" \
-    --argjson timestamp "$ts" \
-    --argjson bytes "$bytes" \
-    --argjson mod7 "$mod7" \
-    '{
-      type:"realtime_state",
-      provider:$provider,
-      endpoint:$endpoint,
-      asset:$asset,
-      currency:$currency,
-      timestamp:$timestamp,
-      bytes:$bytes,
-      sha256:$sha256,
-      sha1:$sha1,
-      mod7:$mod7,
-      raw:$raw
-    }' >"$RUN/realtime.$$.json"
-
-  mv -f "$RUN/realtime.$$.json" "$REALTIME_LAST"
-
-  cp "$REALTIME_LAST" "$RUN/realtime.current.json"
-
-  printf '%s\n' \
-    "$(jq -c 'del(.raw)' "$REALTIME_LAST")" \
-    >>"$REALTIME_LEDGER"
-
-  persist_event \
-    realtime \
-    "provider=coingecko asset=$AI_REALTIME_ASSET sha256=$sha256 sha1=$sha1 mod7=$mod7" \
-    >/dev/null || true
-
-  cat "$REALTIME_LAST"
-}
-
-  persist_event genesis "genesis=$genesis task=$task" >/dev/null
+  local btc_snapshot btc_hash
+  btc_snapshot="$(btc_state 2>/dev/null || true)"
+  btc_hash="$(sha256_text "${btc_snapshot:-disabled}")"
+  persist_event genesis "genesis=$genesis task=$task btc_state_sha256=$btc_hash" >/dev/null
   say "genesis=2244-1 hash=$genesis model=$MODEL_TIER views=$VIEWS depth=$DEPTH"
 
   if [[ "$AI_AUTO_REINDEX" == 1 ]]; then
@@ -761,6 +791,9 @@ GENESIS: 2244-1
 GENESIS_HASH: $genesis
 TASK_HASH: $task
 ROUND: $round/$DEPTH
+BTC_STATE_SHA256: $btc_hash
+BTC_STATE:
+${btc_snapshot:-{"enabled":false}}
 REFERENCE: $(reference_context | tr '\n' ';')
 RECALLED MEMORY:
 $recall_context
@@ -806,8 +839,8 @@ status(){
     --arg llama "$LLAMA_CLI" --arg model "${MODEL_PATH:-unresolved}" --arg tier "${MODEL_TIER:-none}" \
     --argjson views "$VIEWS" --argjson depth "$DEPTH" --argjson threads "$THREADS" \
     --argjson concurrency "$(calc_concurrency)" --argjson mem "$(mem_available_mb)" \
-    --arg reference "$REFERENCE_FILE" \
-    '{version:$version,workspace:$root,state:$state,db:$db,index:$index,ledger:$ledger,llama:$llama,model:$model,tier:$tier,views:$views,depth:$depth,threads:$threads,physical_concurrency:$concurrency,mem_available_mb:$mem,reference:$reference}'
+    --arg reference "$REFERENCE_FILE" --arg realtime "$STATE/realtime/manifest.json" \
+    '{version:$version,workspace:$root,state:$state,db:$db,index:$index,ledger:$ledger,llama:$llama,model:$model,tier:$tier,views:$views,depth:$depth,threads:$threads,physical_concurrency:$concurrency,mem_available_mb:$mem,reference:$reference,realtime_manifest:$realtime}'
 }
 doctor(){
   local a=''; resolve_model && a="$MODEL_PATH" || a='none'
@@ -818,7 +851,7 @@ doctor(){
   printf 'model: %s\n' "$a"
   printf 'memory: %s MB available\n' "$(mem_available_mb)"
   printf 'physical concurrency: %s\n' "$(calc_concurrency)"
-  for x in jq sha256sum md5sum awk sed find fold timeout flock node; do have "$x" && printf '%s=OK\n' "$x" || printf '%s=missing/optional\n' "$x"; done
+  for x in jq sha256sum sha1sum md5sum awk sed find fold timeout flock node curl iconv; do have "$x" && printf '%s=OK\n' "$x" || printf '%s=missing/optional\n' "$x"; done
   if [[ -x "$LLAMA_CLI" ]]; then "$LLAMA_CLI" --version 2>&1 | head -n1 || true; fi
   [[ -s "$DB" ]] && jq empty "$DB" && echo 'memory.json=VALID' || echo 'memory.json=INVALID'
   [[ -s "$INDEX" ]] && jq empty "$INDEX" && echo 'file_index.json=VALID' || echo 'file_index.json=INVALID'
@@ -883,7 +916,9 @@ Source review / changes:
   ai crud create|read|write|append|delete PATH [DATA]
 
 Provenance / diagnostics:
-  ai hash TEXT | artifact FILE | memory | ledger [N]
+  ai hash TEXT | state-hash TEXT | artifact FILE | memory | ledger [N]
+  ai btc state|manifest|address ADDRESS|tx TXID|block [HEIGHT|HASH|tip]
+  ai soap create|read|write|append|delete PATH [DATA]
   ai reference | ai reference-ingest
   ai status | doctor | models | config | version | repl
 
@@ -917,6 +952,9 @@ main(){
     models|model) models;;
     config) printf 'AI_VERSION=%s\nAI_HOME=%s\nSTATE=%s\nDB=%s\nINDEX=%s\nLEDGER=%s\nWORKSPACE=%s\nREFERENCE_FILE=%s\nLLAMA_CLI=%s\nPRIMARY=%s\nFALLBACK=%s\nVIEWS=%s\nDEPTH=%s\nTHREADS=%s\nAI_CONCURRENCY=%s\n' "$AI_VERSION" "$AI_HOME" "$STATE" "$DB" "$INDEX" "$LEDGER" "$WORKSPACE" "$REFERENCE_FILE" "$LLAMA_CLI" "$PRIMARY" "$FALLBACK" "$VIEWS" "$DEPTH" "$THREADS" "$AI_CONCURRENCY";;
     hash) hash_cmd "$@";;
+    state-hash) state_hash "${1:-}" "${2:-cli}";;
+    btc) case "${1:-state}" in state) btc_state;; manifest) btc_manifest;; address) btc_address_info "${2:-}";; tx) btc_tx_info "${2:-}";; block) btc_block_info "${2:-tip}";; *) die 'usage: ai btc state|manifest|address ADDRESS|tx TXID|block [HEIGHT|HASH|tip]';; esac;;
+    soap) soap_crud "$@";;
     scan|index) index_cmd "${1:-$WORKSPACE}";;
     hydrate) hydrate_tree "${1:-$WORKSPACE}";;
     rehash|diff) rehash_cmd;;
