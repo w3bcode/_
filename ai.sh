@@ -4,7 +4,7 @@
 # Unified local AI controller: llama.cpp + bounded state + SHA lineage
 # Android/Termux/PRoot safe profile. Python is optional; Ollama is not used.
 # =============================================================================
-set -Eeuo pipefail
+set -Eeo pipefail
 IFS=$'\n\t'
 
 AI_VERSION="253.1.0"
