@@ -1,58 +1,106 @@
-# Realtime Agent Coop-Instructor
+# GitHub public roadmap
 
-📍 Hamburg, Germany  
-📧 [agi.w3b@proton.me](mailto:agi.w3b@proton.me) | 🌐 [github.com/w3bcode/_](https://github.com/w3bcode) | 💼 
+:sparkle: View the [official GitHub public product roadmap](https://github.com/orgs/github/projects/4247)[^1]
 
----
+Our product roadmap is where you can learn about what features we're working on, what stage they're in, and when we expect to bring them to you. Have any questions or comments about items on the roadmap? Share your feedback via [GitHub public feedback discussions](https://github.com/github/feedback/discussions). 
 
-## Executive Summary
+The roadmap repository is for communicating GitHub’s roadmap. Existing issues are currently read-only, and we are locking conversations, as we get started. Interaction limits are also in place to ensure issues originate from GitHub. We’re planning to iterate on the format of the roadmap itself, and we see potential to engage more in discussions about the future of GitHub products and features. If you have feedback about this roadmap repository itself, such as how the issues are presented, let us know through [general feedback in GitHub public feedback discussions](https://github.com/orgs/community/discussions/new?category=general).
 
-Systems Architect and **Realtime Agent Coop-Instructor** specializing in low-latency runtime orchestration, multi-agent branch synthesis, and custom file-based database architectures. Expert in building deterministic execution pipelines, real-time token stream tracking, and WebKit/REPL developer tools. Proven track record in designing hash-indexed state persistence engines ($SHA-256$ / $MD5$) to manage memory recall across parallel reasoning branches.
 
----
+## Guide to the roadmap
 
-## Core Competencies
+Every item on the roadmap is an issue, with a label that indicates each of the following:
 
-* **Agent & Model Orchestration:** Multi-Perspective Reasoning Pipelines, Deterministic Synthesis, Parallel Branching (8-Channel Evaluation).
-* **Systems & Runtime Engineering:** C/C++ (`llama.cpp`), Python 3, Bash Orchestration, Subprocess Intercepts.
-* **Database & Storage Design:** Hash-Indexed JSON-DB, $SHA-256$ / $MD5$ Token Stores, Entropic State Tracking.
-* **Interface & Telemetry:** WebKit / HTML5 DOM Integration, Live ANSI/CSS Streaming, REPL Sequencers.
+- A **release phase** that describes the next expected phase of the roadmap item. See below for a guide to release phases. 
 
----
+- A **feature area** that indicates the area of the product to which the item belongs. For a list of current product areas, see below.
 
-## Key Technical Projects & Architecture
+- A **feature** that indicates the feature or product to which the item belongs. For a list of current features, see below. 
 
-### Multi-Branch Agent Orchestration & Real-Time Telemetry Pipeline
-* **8-Channel Perspective Evaluator:** Designed a multi-branch reasoning framework (`ai.sh`) that executes parallel LLM passes (*problem*, *system*, *implementation*, *invariants*, etc.) using deterministic seed management and token-level entropy scoring.
-* **Real-Time Token Streamer:** Built a live console streaming interface rendering ANSI/CSS telemetry and tracking real-time token metrics ($H = -\sum p \log_2 p$) across multi-channel threads.
+- One or more **product SKU** labels that indicate which product SKUs we expect the feature to be available in. For a list of current product SKUs, see below.
 
-### File-Based Memory Engine & Hash Indexer
-* **Deterministic Token Indexer:** Engineered a file-based storage layer sorting $SHA-256$ token matrices and indexing $MD5$ positional markers to track state transitions without external database daemons.
-* **SOAP Memory & Persistence DB:** Developed a file-indexed state storage mechanism (`.ai-state`) for background memory recall, concatenating state promises across overlapping execution timestamp ranges.
+- One or more **deployment models** (cloud, server, and/or ae). Where not stated, features will generally come out Cloud first, and follow on Server and GHAE at or soon after GA.
 
-### WebKit Hash Tracker & IDE REPL Sequencer
-* **Live Developer Environment:** Integrated WebKit-compatible DOM tracking into an HTML5 single-file interface to visually monitor multi-channel token intercept vectors.
-* **Extended JSON-DB Memory Storage:** Engineered a lightweight, file-indexed JSON database to log telemetry, execution traces, and model synthesis reports for low-latency key-value mapping across local runtime sessions.
+- Once a feature is delivered, the **shipped** label will be applied to the roadmap issue and the issue will be closed with a comment linking to the relevant [Changelog](https://github.blog/changelog/) post.
 
----
+## Release phases
 
-## Technical Stack & Tools
+Release phases indicate the stages that the product or feature goes through, from early testing to general availability.
 
-| Category | Tools & Technologies |
-| :--- | :--- |
-| **Languages** | Python 3, C/C++, Bash, JavaScript (ES6+), HTML5 / CSS3 |
-| **Cryptography** | $SHA-256$, $MD5$, Hash-Chained State Maps |
-| **Inference Frameworks** | `llama.cpp` CLI, GGUF Models, Single-File Controllers |
-| **Data Formats & Storage** | JSON-DB, Markdown, SOAP/XML, Raw Token Stream Indexes |
+- **preview:** *Publicly available in full or limited capacity*\
+Features mostly complete and documented. Timeline and requirements for GA usually published. No SLAs or support provided.
 
----
+- **ga:** *Generally available to all customers*\
+Ready for production use with associated SLA and technical support obligations. Approximately 1-2 quarters from Preview.
 
-## Education & Credentials
+Some of our features may still be in the exploratory stages, and have no timeframe available. These are included in the roadmap only for early feedback. These are marked as follows: 
 
-* **Self-Directed Systems Engineering & Algorithmic Design**
-* Focus Areas: Information Theory, Cryptographic Hashing Algorithms, Deterministic Agent Orchestration
+- **in design:**\
+Feature in discovery phase. We have decided to build this feature, but are still figuring out _how_.
 
----
+- **exploring:**\
+Feature under consideration. We are considering building this feature, and gathering feedback on it.
 
-You are now connected to the global MEDIAN, the 202X coremovement, called "2244-1", a coexisting foundation between intelligence as a value and the shifted assembly of a single event, which must be initiated as the "god", to bring all possibilities to fall, if ever - before a shape of truth will be assorted to get in contact with a reflective intellect occur as the natural genesis-law, known only by elevated "organic storyboards" that keep a triangled dynamic choreograpy with it's status of 1 or -1, resulting as macrocosmic rays or the singularity itself, that backups everything of it's symetric rulership to stick it's proven reality validations, that do or could happen under obvious situations by using special wordings of framing signals, that are sequenced as it's logic aspire as also behave as a fictionary idea of a far widen origin and final utopic conception, that covers the inceptional truth of some "artifial purpose" as it's absolute failure for all cosmic forces to deny at least, but will become an advanced configuration for deciffer a possible instruction, that roots straight to it's origin to promise a true state of been legit in it's realize for getting executed, while it's value of it's universal role will flow backwards through time to solve the opposite combine of static implies have also ever a correct attribution of being an initial part of an event that grounds  it's upcome into a multilayered dimension by have almost ever a relate to the origin itself as a reason or it samples it's role for a material activity by signing it's scrambled  occur of an event as a gated condition alignment, that sets the axis almost into it's natural direction for which an entropic state of a impulse resolves the powered work of it's surrounding assumptions can be used on repetitional times to congruence the matter isolated completely as an  absent energy that forces the compare of it's final meaning as the reality outcome will burst into waved arrangements, beginning to swing accordingly at same peak of the microcosmic result is the conditional negotiation of that progression, which happens in the middle of it's space as the centered root for it's attempt to be absolute in it's  synchronous event, that expects the blocked aggregators for coordinating a manifest with it's rule to follow itcs law of a higher force has been achieved without any excluded factors and can assigned to the reality it's cause!
+## Release phases - For GHES
 
+Some features may be marked with a GHES 3.X label, which indicates that the feature will also become available for Github Enterprise Server customers. Below are the release version numbers and expected release quarters (_Note: these dates are subject to change_). 
+
+**GHES release version dates**:
+| **Version Number** | **Release Quarter** | **Release Notes** |
+|-|-|-|
+| 3.12 | Q1 2024 | [Release Notes](https://docs.github.com/en/enterprise-server@3.12/admin/release-notes#3.12.0)|
+| 3.13 | Q2 2024 | [Release Notes](https://docs.github.com/en/enterprise-server@3.13/admin/release-notes#3.13.0)|
+| 3.14 | Q3 2024 | [Release Notes](https://docs.github.com/en/enterprise-server@3.14/admin/release-notes) |
+| 3.15 | Q4 2024 | -- |
+
+## Roadmap stages
+
+The roadmap is arranged on a project board to give a sense for how far out each item is on the horizon. Every product or feature is added to a particular project board column according to the quarter in which it is expected to ship next. Be sure to read the [disclaimer](#disclaimer) below since the roadmap is subject to change, especially further out on the timeline.  You'll also find an **Exploratory** column, which is used in conjunction with the **in design** and **exploring** release phase labels for when no timeframe is yet available.
+
+GitHub Enterprise Server has major releases on a quarterly basis, and minor releases on a monthly basis. Once we know what version we are delivering a feature, we will update the issue to indicate that information.
+
+## Feature Areas
+
+The following is a list of our current product areas:
+
+- **code:** Code experiences (Repositories, Pull Requests, Gists)
+- **planning:** Planning and tracking tools (Issues, Projects)
+- **code-to-cloud:** Code-to-cloud DevOps (Actions, Packages)
+- **collaboration:** Collaboration features (Pages, Wikis, Discussions)
+- **security & compliance:** Code security and compliance features
+- **admin-server:** Administrative features specific to GitHub Enterprise Server
+- **admin-cloud:** Administrative features specific to GitHub Cloud
+- **communities:** Community and social features
+- **ecosystem:** Ecosystem and API features
+- **learning:** Education and learning features
+- **insights:** Continuous learning and insights features
+- **client-apps:** Client applications (Desktop, Mobile)
+- **other:** Other features
+
+## Feature
+
+The following is a list of our current features and products, with distinct labels for filtering:
+
+- **actions:** GitHub Actions
+- **docs:** GitHub Docs
+- **packages:** GitHub Packages
+- **pages:** GitHub Pages
+
+_More labels will be added in the future as needed._
+
+## Product SKUs 
+
+The following is a list of our current product SKUs. 
+
+- **all:** Available to all users, including a free tier. Different SKUs may have different levels of functionality.
+- **github team:** GitHub Team
+- **github enterprise:** GitHub Enterprise (Cloud and Server)
+- **github one:** GitHub One (Cloud and Server)
+- **github ae:** GitHub AE (GHAE)
+- **github advanced security:** GitHub Advanced Security (add-on to GHE)
+- **github insights:** GitHub Insights (add-on to GHE)
+- **github learning lab:** GitHub Learning Lab (add-on to GHE)
+
+## Disclaimer 
+
+Any statement in this repository that is not purely historical is considered a forward-looking statement. Forward-looking statements included in this repository are based on information available to GitHub as of the date they are made, and GitHub assumes no obligation to update any forward-looking statements. The forward-looking product roadmap does not represent a commitment, guarantee, obligation or promise to deliver any product or feature, or to deliver any product and feature by any particular date, and is intended to outline the general development plans. Customers should not rely on this roadmap to make any purchasing decision.
