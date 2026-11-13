@@ -256,3 +256,7 @@ case "${1:-}" in
         ;;
     *) echo "Usage: $0 {start|stop|status|query|generate|recursive|agent|brain}" ;;
 esac
+
+exit
+
+alias agi='llama-cli -m ~/.ai/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf --prompt "$1"'

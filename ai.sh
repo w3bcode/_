@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# ai-fusion.sh 3.0.0 — high-performance local AI fusion controller
+# ai-fusion.sh 26.0.0 — high-performance local AI fusion controller
 # =============================================================================
 # Unified llama.cpp CLI + Ollama + Gemini Interactions backend.
 #
